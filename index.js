@@ -323,9 +323,16 @@ process.on('unhandledRejection', (error) => {
   process.exit(1);
 });
 
-httpServer = app.listen(env.server.port, env.server.host, () => {
+httpServer = app.listen(env.server.port, env.server.host, async () => {
   console.log(`Auth API listening on http://${env.server.host}:${env.server.port}`);
   console.log(`DeepSeek AI ${isDeepSeekConfigured() ? 'configured' : 'not configured'}.`);
+
+  try {
+    await ensureMongoClient();
+    console.log('MongoDB connected successfully at startup.');
+  } catch (error) {
+    console.error('MongoDB connection failed at startup:', error.message || error);
+  }
 });
 
 httpServer.on('close', () => {
