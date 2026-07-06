@@ -17,9 +17,9 @@ export const env = {
     host: optionalString('HOST', 'localhost'),
     clientOrigin: optionalString('CLIENT_ORIGIN', 'http://localhost:5173'),
   },
-  mongo: {
-    uri: optionalString('MONGODB_URI'),
-    databaseName: optionalString('MONGODB_DB', 'prisma'),
+  firebase: {
+    serviceAccountBase64: optionalString('FIREBASE_SERVICE_ACCOUNT_BASE64'),
+    projectId: optionalString('FIREBASE_PROJECT_ID'),
   },
   deepseek: {
     apiKey: optionalString('DEEPSEEK_API_KEY'),

@@ -1,6 +1,6 @@
 import cors from 'cors';
 import express from 'express';
-import { MongoClient } from 'mongodb';
+import admin from 'firebase-admin';
 import { env, isDeepSeekConfigured } from './config/env.js';
 import { createDeepSeekReply } from './services/deepseek.js';
 import { getPortfolioMarkets, getSupportedPriceAssets, getUsdPriceForAsset } from './services/prices.js';
@@ -8,15 +8,7 @@ import { getPortfolioMarkets, getSupportedPriceAssets, getUsdPriceForAsset } fro
 const app = express();
 const usernamePattern = /^[a-zA-Z0-9_]{3,24}$/;
 
-const mongoClientOptions = {
-  serverSelectionTimeoutMS: 5000,
-  connectTimeoutMS: 5000,
-  socketTimeoutMS: 10000,
-};
-
-let client;
-let usersCollection;
-let accountsCollection;
+let db;
 let httpServer;
 
 app.use(cors({ origin: env.server.clientOrigin }));
@@ -27,46 +19,46 @@ app.use((request, _response, next) => {
   next();
 });
 
-async function ensureMongoClient() {
-  if (!env.mongo.uri) {
-    throw new Error('MONGODB_URI is missing. Add it to .env before starting the server.');
+function getServiceAccount() {
+  if (!env.firebase.serviceAccountBase64) {
+    throw new Error('FIREBASE_SERVICE_ACCOUNT_BASE64 is missing. Put the base64-encoded Firebase service account JSON in server/.env.');
   }
 
-  if (!client) {
-    client = new MongoClient(env.mongo.uri, mongoClientOptions);
-    console.log('Connecting to MongoDB...');
-    await client.connect();
-    console.log('MongoDB connected.');
+  const decoded = Buffer.from(env.firebase.serviceAccountBase64, 'base64').toString('utf8');
+  return JSON.parse(decoded);
+}
+
+async function ensureFirebase() {
+  if (db) {
+    return db;
   }
 
-  return client;
+  if (!admin.apps.length) {
+    const serviceAccount = getServiceAccount();
+    admin.initializeApp({
+      credential: admin.credential.cert(serviceAccount),
+      projectId: env.firebase.projectId || serviceAccount.project_id,
+    });
+  }
+
+  db = admin.firestore();
+  console.log('Firebase Firestore connected.');
+  return db;
 }
 
 async function getUsersCollection() {
-  if (usersCollection) {
-    return usersCollection;
-  }
-
-  const mongoClient = await ensureMongoClient();
-  const db = mongoClient.db(env.mongo.databaseName);
-  usersCollection = db.collection('users');
-  await usersCollection.createIndex({ usernameLower: 1 }, { unique: true });
-  await usersCollection.createIndex({ walletAddress: 1 }, { unique: true });
-
-  return usersCollection;
+  const firestore = await ensureFirebase();
+  return firestore.collection('users');
 }
 
 async function getAccountsCollection() {
-  if (accountsCollection) {
-    return accountsCollection;
-  }
+  const firestore = await ensureFirebase();
+  return firestore.collection('accounts');
+}
 
-  const mongoClient = await ensureMongoClient();
-  const db = mongoClient.db(env.mongo.databaseName);
-  accountsCollection = db.collection('accounts');
-  await accountsCollection.createIndex({ walletAddress: 1 }, { unique: true });
-
-  return accountsCollection;
+async function getChatsCollection() {
+  const firestore = await ensureFirebase();
+  return firestore.collection('chats');
 }
 
 function cleanUsername(value) {
@@ -75,6 +67,42 @@ function cleanUsername(value) {
 
 function cleanWalletAddress(value) {
   return String(value || '').trim();
+}
+
+function toIsoTimestamp(value) {
+  if (!value) {
+    return null;
+  }
+
+  if (value instanceof Date) {
+    return value.toISOString();
+  }
+
+  if (typeof value.toDate === 'function') {
+    return value.toDate().toISOString();
+  }
+
+  return value;
+}
+
+function serializeUser(user) {
+  return {
+    username: user.username,
+    usernameLower: user.usernameLower,
+    walletAddress: user.walletAddress,
+    createdAt: toIsoTimestamp(user.createdAt),
+    updatedAt: toIsoTimestamp(user.updatedAt),
+  };
+}
+
+function serializeChat(chat) {
+  return {
+    id: chat.id,
+    walletAddress: chat.walletAddress,
+    message: chat.message,
+    reply: chat.reply,
+    createdAt: toIsoTimestamp(chat.createdAt),
+  };
 }
 
 function logApiError(context, error) {
@@ -110,34 +138,68 @@ app.post('/api/auth/register', async (request, response) => {
       return response.status(400).json({ message: 'Wallet address is required.' });
     }
 
-    const users = await getUsersCollection();
-    const existingWallet = await users.findOne({ walletAddress });
+    const firestore = await ensureFirebase();
+    const users = firestore.collection('users');
+    const userRef = users.doc(usernameLower);
 
-    if (existingWallet) {
-      if (existingWallet.usernameLower !== usernameLower) {
-        return response.status(409).json({ message: `This wallet is already registered as ${existingWallet.username}.` });
+    const result = await firestore.runTransaction(async (transaction) => {
+      const usernameDoc = await transaction.get(userRef);
+      const walletSnapshot = await transaction.get(
+        users.where('walletAddress', '==', walletAddress).limit(1),
+      );
+
+      if (!walletSnapshot.empty) {
+        const existingWallet = walletSnapshot.docs[0].data();
+        if (existingWallet.usernameLower !== usernameLower) {
+          const error = new Error(`This wallet is already registered as ${existingWallet.username}.`);
+          error.statusCode = 409;
+          throw error;
+        }
+
+        return {
+          status: 200,
+          user: existingWallet,
+        };
       }
 
-      return response.json({
-        username: existingWallet.username,
-        walletAddress: existingWallet.walletAddress,
-      });
-    }
+      if (usernameDoc.exists) {
+        const existingUsername = usernameDoc.data();
+        if (existingUsername.walletAddress !== walletAddress) {
+          const error = new Error('That username is already taken. Please choose another one.');
+          error.statusCode = 409;
+          throw error;
+        }
 
-    const now = new Date();
+        return {
+          status: 200,
+          user: existingUsername,
+        };
+      }
 
-    await users.insertOne({
-      username,
-      usernameLower,
-      walletAddress,
-      createdAt: now,
-      updatedAt: now,
+      const user = {
+        username,
+        usernameLower,
+        walletAddress,
+        createdAt: admin.firestore.FieldValue.serverTimestamp(),
+        updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+      };
+
+      transaction.set(userRef, user);
+
+      return {
+        status: 201,
+        user: {
+          ...user,
+          createdAt: new Date(),
+          updatedAt: new Date(),
+        },
+      };
     });
 
-    return response.status(201).json({ username, walletAddress });
+    return response.status(result.status).json(serializeUser(result.user));
   } catch (error) {
-    if (error?.code === 11000) {
-      return response.status(409).json({ message: 'That username is already taken. Please choose another one.' });
+    if (error?.statusCode) {
+      return response.status(error.statusCode).json({ message: error.message });
     }
 
     return sendApiError(response, 500, error.message || 'Could not save user.', error, 'auth/register');
@@ -153,16 +215,14 @@ app.get('/api/users/:username', async (request, response) => {
     }
 
     const users = await getUsersCollection();
-    const user = await users.findOne(
-      { usernameLower },
-      { projection: { _id: 0, username: 1, walletAddress: 1 } },
-    );
+    const userDoc = await users.doc(usernameLower).get();
+    const user = userDoc.exists ? userDoc.data() : null;
 
     if (!user) {
       return response.status(404).json({ message: 'No user found with that username.' });
     }
 
-    return response.json(user);
+    return response.json(serializeUser(user));
   } catch (error) {
     return sendApiError(response, 500, error.message || 'Could not look up username.', error, 'users/:username');
   }
@@ -177,16 +237,14 @@ app.get('/api/wallets/:walletAddress', async (request, response) => {
     }
 
     const users = await getUsersCollection();
-    const user = await users.findOne(
-      { walletAddress },
-      { projection: { _id: 0, username: 1, walletAddress: 1 } },
-    );
+    const walletSnapshot = await users.where('walletAddress', '==', walletAddress).limit(1).get();
+    const user = walletSnapshot.empty ? null : walletSnapshot.docs[0].data();
 
     if (!user) {
       return response.status(404).json({ message: 'No username is registered for this wallet yet.' });
     }
 
-    return response.json(user);
+    return response.json(serializeUser(user));
   } catch (error) {
     return sendApiError(response, 500, error.message || 'Could not look up wallet.', error, 'wallets/:walletAddress');
   }
@@ -201,10 +259,8 @@ app.get('/api/account/:walletAddress', async (request, response) => {
     }
 
     const accounts = await getAccountsCollection();
-    const account = await accounts.findOne(
-      { walletAddress },
-      { projection: { _id: 0, walletAddress: 1, profile: 1, data: 1, network: 1 } },
-    );
+    const accountDoc = await accounts.doc(walletAddress).get();
+    const account = accountDoc.exists ? accountDoc.data() : null;
 
     if (!account) {
       return response.json({ profile: null, data: null, network: 'testnet' });
@@ -232,30 +288,28 @@ app.put('/api/account/:walletAddress', async (request, response) => {
     const profile = request.body?.profile || null;
     const data = request.body?.data || null;
     const network = request.body?.network === 'mainnet' ? 'mainnet' : 'testnet';
-    const now = new Date();
+    const firestore = await ensureFirebase();
+    const accountRef = firestore.collection('accounts').doc(walletAddress);
 
-    const accounts = await getAccountsCollection();
-    await accounts.updateOne(
-      { walletAddress },
-      {
-        $set: {
-          profile,
-          data,
-          network,
-          updatedAt: now,
-        },
-        $setOnInsert: {
-          walletAddress,
-          createdAt: now,
-        },
-      },
-      { upsert: true },
-    );
+    const saved = await firestore.runTransaction(async (transaction) => {
+      const currentDoc = await transaction.get(accountRef);
+      const now = admin.firestore.FieldValue.serverTimestamp();
+      const next = {
+        walletAddress,
+        profile,
+        data,
+        network,
+        updatedAt: now,
+        ...(currentDoc.exists ? {} : { createdAt: now }),
+      };
 
-    const saved = await accounts.findOne(
-      { walletAddress },
-      { projection: { _id: 0, walletAddress: 1, profile: 1, data: 1, network: 1 } },
-    );
+      transaction.set(accountRef, next, { merge: true });
+
+      return {
+        ...(currentDoc.exists ? currentDoc.data() : {}),
+        ...next,
+      };
+    });
 
     return response.json({
       walletAddress: saved?.walletAddress || walletAddress,
@@ -293,15 +347,55 @@ app.get('/api/portfolio/markets', async (request, response) => {
   }
 });
 
+app.get('/api/ai/chat/:walletAddress', async (request, response) => {
+  try {
+    const walletAddress = cleanWalletAddress(request.params.walletAddress);
+
+    if (!walletAddress) {
+      return response.status(400).json({ message: 'Wallet address is required.' });
+    }
+
+    const chats = await getChatsCollection();
+    const snapshot = await chats
+      .where('walletAddress', '==', walletAddress)
+      .get();
+
+    const messages = snapshot.docs
+      .map((doc) => serializeChat({ id: doc.id, ...doc.data() }))
+      .sort((left, right) => {
+        const leftTime = left.createdAt ? new Date(left.createdAt).getTime() : 0;
+        const rightTime = right.createdAt ? new Date(right.createdAt).getTime() : 0;
+        return leftTime - rightTime;
+      })
+      .slice(-25);
+
+    return response.json({ messages });
+  } catch (error) {
+    return sendApiError(response, 500, error.message || 'Could not load chat history.', error, 'ai/chat/get');
+  }
+});
+
 app.post('/api/ai/chat', async (request, response) => {
   try {
     const message = String(request.body?.message || '').trim();
+    const walletAddress = cleanWalletAddress(request.body?.walletAddress || '');
 
     if (!message) {
       return response.status(400).json({ message: 'Message is required.' });
     }
 
     const reply = await createDeepSeekReply(message);
+
+    if (walletAddress) {
+      const chats = await getChatsCollection();
+      await chats.add({
+        walletAddress,
+        message,
+        reply,
+        createdAt: admin.firestore.FieldValue.serverTimestamp(),
+      });
+    }
+
     return response.json({ reply });
   } catch (error) {
     return response.status(error.statusCode || 500).json({ message: error.message || 'AI chat failed.' });
@@ -311,7 +405,6 @@ app.post('/api/ai/chat', async (request, response) => {
 async function shutdown(signal) {
   console.log(`Received ${signal}. Closing Auth API...`);
   httpServer?.close();
-  await client?.close();
   process.exit(0);
 }
 
@@ -333,10 +426,10 @@ httpServer = app.listen(env.server.port, env.server.host, async () => {
   console.log(`DeepSeek AI ${isDeepSeekConfigured() ? 'configured' : 'not configured'}.`);
 
   try {
-    await ensureMongoClient();
-    console.log('MongoDB connected successfully at startup.');
+    await ensureFirebase();
+    console.log('Firebase Firestore connected successfully at startup.');
   } catch (error) {
-    console.error('MongoDB connection failed at startup:', error.message || error);
+    console.error('Firebase Firestore connection failed at startup:', error.message || error);
   }
 });
 
