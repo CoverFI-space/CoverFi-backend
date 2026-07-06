@@ -8,6 +8,12 @@ import { getPortfolioMarkets, getSupportedPriceAssets, getUsdPriceForAsset } fro
 const app = express();
 const usernamePattern = /^[a-zA-Z0-9_]{3,24}$/;
 
+const mongoClientOptions = {
+  serverSelectionTimeoutMS: 5000,
+  connectTimeoutMS: 5000,
+  socketTimeoutMS: 10000,
+};
+
 let client;
 let usersCollection;
 let accountsCollection;
@@ -16,19 +22,28 @@ let httpServer;
 app.use(cors({ origin: env.server.clientOrigin }));
 app.use(express.json({ limit: '32kb' }));
 
-async function getUsersCollection() {
+async function ensureMongoClient() {
   if (!env.mongo.uri) {
     throw new Error('MONGODB_URI is missing. Add it to .env before starting the server.');
   }
 
+  if (!client) {
+    client = new MongoClient(env.mongo.uri, mongoClientOptions);
+    console.log('Connecting to MongoDB...');
+    await client.connect();
+    console.log('MongoDB connected.');
+  }
+
+  return client;
+}
+
+async function getUsersCollection() {
   if (usersCollection) {
     return usersCollection;
   }
 
-  client = new MongoClient(env.mongo.uri);
-  await client.connect();
-
-  const db = client.db(env.mongo.databaseName);
+  const mongoClient = await ensureMongoClient();
+  const db = mongoClient.db(env.mongo.databaseName);
   usersCollection = db.collection('users');
   await usersCollection.createIndex({ usernameLower: 1 }, { unique: true });
   await usersCollection.createIndex({ walletAddress: 1 }, { unique: true });
@@ -37,20 +52,12 @@ async function getUsersCollection() {
 }
 
 async function getAccountsCollection() {
-  if (!env.mongo.uri) {
-    throw new Error('MONGODB_URI is missing. Add it to .env before starting the server.');
-  }
-
   if (accountsCollection) {
     return accountsCollection;
   }
 
-  if (!client) {
-    client = new MongoClient(env.mongo.uri);
-    await client.connect();
-  }
-
-  const db = client.db(env.mongo.databaseName);
+  const mongoClient = await ensureMongoClient();
+  const db = mongoClient.db(env.mongo.databaseName);
   accountsCollection = db.collection('accounts');
   await accountsCollection.createIndex({ walletAddress: 1 }, { unique: true });
 
@@ -65,12 +72,22 @@ function cleanWalletAddress(value) {
   return String(value || '').trim();
 }
 
+function logApiError(context, error) {
+  const detail = error instanceof Error ? error.stack || error.message : String(error);
+  console.error(`[${context}]`, detail);
+}
+
+function sendApiError(response, status, message, error, context) {
+  logApiError(context, error);
+  response.status(status).json({ message });
+}
+
 app.get('/api/health', async (_request, response) => {
   try {
     await getUsersCollection();
     response.json({ ok: true, aiConfigured: isDeepSeekConfigured() });
   } catch (error) {
-    response.status(500).json({ message: error.message || 'Database is not ready.' });
+    sendApiError(response, 500, error.message || 'Database is not ready.', error, 'health');
   }
 });
 
@@ -118,7 +135,7 @@ app.post('/api/auth/register', async (request, response) => {
       return response.status(409).json({ message: 'That username is already taken. Please choose another one.' });
     }
 
-    return response.status(500).json({ message: error.message || 'Could not save user.' });
+    return sendApiError(response, 500, error.message || 'Could not save user.', error, 'auth/register');
   }
 });
 
@@ -142,7 +159,7 @@ app.get('/api/users/:username', async (request, response) => {
 
     return response.json(user);
   } catch (error) {
-    return response.status(500).json({ message: error.message || 'Could not look up username.' });
+    return sendApiError(response, 500, error.message || 'Could not look up username.', error, 'users/:username');
   }
 });
 
@@ -166,7 +183,7 @@ app.get('/api/wallets/:walletAddress', async (request, response) => {
 
     return response.json(user);
   } catch (error) {
-    return response.status(500).json({ message: error.message || 'Could not look up wallet.' });
+    return sendApiError(response, 500, error.message || 'Could not look up wallet.', error, 'wallets/:walletAddress');
   }
 });
 
@@ -195,7 +212,7 @@ app.get('/api/account/:walletAddress', async (request, response) => {
       network: account.network || 'testnet',
     });
   } catch (error) {
-    return response.status(500).json({ message: error.message || 'Could not load account data.' });
+    return sendApiError(response, 500, error.message || 'Could not load account data.', error, 'account/get');
   }
 });
 
@@ -242,7 +259,7 @@ app.put('/api/account/:walletAddress', async (request, response) => {
       network: saved?.network || network,
     });
   } catch (error) {
-    return response.status(500).json({ message: error.message || 'Could not save account data.' });
+    return sendApiError(response, 500, error.message || 'Could not save account data.', error, 'account/put');
   }
 });
 
