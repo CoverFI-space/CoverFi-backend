@@ -10,6 +10,7 @@ const usernamePattern = /^[a-zA-Z0-9_]{3,24}$/;
 
 let client;
 let usersCollection;
+let accountsCollection;
 let httpServer;
 
 app.use(cors({ origin: env.server.clientOrigin }));
@@ -33,6 +34,27 @@ async function getUsersCollection() {
   await usersCollection.createIndex({ walletAddress: 1 }, { unique: true });
 
   return usersCollection;
+}
+
+async function getAccountsCollection() {
+  if (!env.mongo.uri) {
+    throw new Error('MONGODB_URI is missing. Add it to .env before starting the server.');
+  }
+
+  if (accountsCollection) {
+    return accountsCollection;
+  }
+
+  if (!client) {
+    client = new MongoClient(env.mongo.uri);
+    await client.connect();
+  }
+
+  const db = client.db(env.mongo.databaseName);
+  accountsCollection = db.collection('accounts');
+  await accountsCollection.createIndex({ walletAddress: 1 }, { unique: true });
+
+  return accountsCollection;
 }
 
 function cleanUsername(value) {
@@ -145,6 +167,82 @@ app.get('/api/wallets/:walletAddress', async (request, response) => {
     return response.json(user);
   } catch (error) {
     return response.status(500).json({ message: error.message || 'Could not look up wallet.' });
+  }
+});
+
+app.get('/api/account/:walletAddress', async (request, response) => {
+  try {
+    const walletAddress = cleanWalletAddress(request.params.walletAddress);
+
+    if (!walletAddress) {
+      return response.status(400).json({ message: 'Wallet address is required.' });
+    }
+
+    const accounts = await getAccountsCollection();
+    const account = await accounts.findOne(
+      { walletAddress },
+      { projection: { _id: 0, walletAddress: 1, profile: 1, data: 1, network: 1 } },
+    );
+
+    if (!account) {
+      return response.json({ profile: null, data: null, network: 'testnet' });
+    }
+
+    return response.json({
+      walletAddress: account.walletAddress,
+      profile: account.profile || null,
+      data: account.data || null,
+      network: account.network || 'testnet',
+    });
+  } catch (error) {
+    return response.status(500).json({ message: error.message || 'Could not load account data.' });
+  }
+});
+
+app.put('/api/account/:walletAddress', async (request, response) => {
+  try {
+    const walletAddress = cleanWalletAddress(request.params.walletAddress);
+
+    if (!walletAddress) {
+      return response.status(400).json({ message: 'Wallet address is required.' });
+    }
+
+    const profile = request.body?.profile || null;
+    const data = request.body?.data || null;
+    const network = request.body?.network === 'mainnet' ? 'mainnet' : 'testnet';
+    const now = new Date();
+
+    const accounts = await getAccountsCollection();
+    await accounts.updateOne(
+      { walletAddress },
+      {
+        $set: {
+          profile,
+          data,
+          network,
+          updatedAt: now,
+        },
+        $setOnInsert: {
+          walletAddress,
+          createdAt: now,
+        },
+      },
+      { upsert: true },
+    );
+
+    const saved = await accounts.findOne(
+      { walletAddress },
+      { projection: { _id: 0, walletAddress: 1, profile: 1, data: 1, network: 1 } },
+    );
+
+    return response.json({
+      walletAddress: saved?.walletAddress || walletAddress,
+      profile: saved?.profile || null,
+      data: saved?.data || null,
+      network: saved?.network || network,
+    });
+  } catch (error) {
+    return response.status(500).json({ message: error.message || 'Could not save account data.' });
   }
 });
 
