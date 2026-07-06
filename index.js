@@ -22,6 +22,11 @@ let httpServer;
 app.use(cors({ origin: env.server.clientOrigin }));
 app.use(express.json({ limit: '32kb' }));
 
+app.use((request, _response, next) => {
+  console.log(`[request] ${request.method} ${request.originalUrl}`);
+  next();
+});
+
 async function ensureMongoClient() {
   if (!env.mongo.uri) {
     throw new Error('MONGODB_URI is missing. Add it to .env before starting the server.');
