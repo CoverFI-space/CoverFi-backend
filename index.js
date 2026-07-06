@@ -115,12 +115,27 @@ function sendApiError(response, status, message, error, context) {
   response.status(status).json({ message });
 }
 
+function getFirebaseErrorMessage(error, fallback) {
+  const message = error?.message || '';
+
+  if (String(error?.code) === '7' || message.includes('PERMISSION_DENIED')) {
+    if (message.includes('firestore.googleapis.com')) {
+      return 'Firebase credentials loaded, but the Cloud Firestore API is disabled for this Firebase project. Enable Firestore API for project coverfi, then retry after a few minutes.';
+    }
+
+    return 'Firebase credentials loaded, but this service account does not have permission to read Firestore.';
+  }
+
+  return fallback;
+}
+
 app.get('/api/health', async (_request, response) => {
   try {
-    await getUsersCollection();
+    const users = await getUsersCollection();
+    await users.limit(1).get();
     response.json({ ok: true, aiConfigured: isDeepSeekConfigured() });
   } catch (error) {
-    sendApiError(response, 500, error.message || 'Database is not ready.', error, 'health');
+    sendApiError(response, 500, getFirebaseErrorMessage(error, error.message || 'Database is not ready.'), error, 'health');
   }
 });
 
@@ -202,7 +217,7 @@ app.post('/api/auth/register', async (request, response) => {
       return response.status(error.statusCode).json({ message: error.message });
     }
 
-    return sendApiError(response, 500, error.message || 'Could not save user.', error, 'auth/register');
+    return sendApiError(response, 500, getFirebaseErrorMessage(error, error.message || 'Could not save user.'), error, 'auth/register');
   }
 });
 
@@ -224,7 +239,7 @@ app.get('/api/users/:username', async (request, response) => {
 
     return response.json(serializeUser(user));
   } catch (error) {
-    return sendApiError(response, 500, error.message || 'Could not look up username.', error, 'users/:username');
+    return sendApiError(response, 500, getFirebaseErrorMessage(error, error.message || 'Could not look up username.'), error, 'users/:username');
   }
 });
 
@@ -246,7 +261,7 @@ app.get('/api/wallets/:walletAddress', async (request, response) => {
 
     return response.json(serializeUser(user));
   } catch (error) {
-    return sendApiError(response, 500, error.message || 'Could not look up wallet.', error, 'wallets/:walletAddress');
+    return sendApiError(response, 500, getFirebaseErrorMessage(error, error.message || 'Could not look up wallet.'), error, 'wallets/:walletAddress');
   }
 });
 
@@ -273,7 +288,7 @@ app.get('/api/account/:walletAddress', async (request, response) => {
       network: account.network || 'testnet',
     });
   } catch (error) {
-    return sendApiError(response, 500, error.message || 'Could not load account data.', error, 'account/get');
+    return sendApiError(response, 500, getFirebaseErrorMessage(error, error.message || 'Could not load account data.'), error, 'account/get');
   }
 });
 
@@ -318,7 +333,7 @@ app.put('/api/account/:walletAddress', async (request, response) => {
       network: saved?.network || network,
     });
   } catch (error) {
-    return sendApiError(response, 500, error.message || 'Could not save account data.', error, 'account/put');
+    return sendApiError(response, 500, getFirebaseErrorMessage(error, error.message || 'Could not save account data.'), error, 'account/put');
   }
 });
 
@@ -371,7 +386,7 @@ app.get('/api/ai/chat/:walletAddress', async (request, response) => {
 
     return response.json({ messages });
   } catch (error) {
-    return sendApiError(response, 500, error.message || 'Could not load chat history.', error, 'ai/chat/get');
+    return sendApiError(response, 500, getFirebaseErrorMessage(error, error.message || 'Could not load chat history.'), error, 'ai/chat/get');
   }
 });
 
@@ -398,7 +413,9 @@ app.post('/api/ai/chat', async (request, response) => {
 
     return response.json({ reply });
   } catch (error) {
-    return response.status(error.statusCode || 500).json({ message: error.message || 'AI chat failed.' });
+    return response.status(error.statusCode || 500).json({
+      message: getFirebaseErrorMessage(error, error.message || 'AI chat failed.'),
+    });
   }
 });
 
