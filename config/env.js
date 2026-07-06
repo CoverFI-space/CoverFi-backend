@@ -11,10 +11,21 @@ function optionalNumber(name, fallback) {
   return Number.isFinite(value) ? value : fallback;
 }
 
+function getServerHost() {
+  const host = optionalString('HOST', 'localhost');
+  const isAzureAppService = Boolean(process.env.WEBSITE_SITE_NAME || process.env.WEBSITE_INSTANCE_ID);
+
+  if (isAzureAppService && host === 'localhost') {
+    return '0.0.0.0';
+  }
+
+  return host;
+}
+
 export const env = {
   server: {
     port: optionalNumber('PORT', 8890),
-    host: optionalString('HOST', 'localhost'),
+    host: getServerHost(),
     clientOrigin: optionalString('CLIENT_ORIGIN', 'http://localhost:5173'),
   },
   firebase: {

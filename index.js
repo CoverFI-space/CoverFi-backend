@@ -11,7 +11,34 @@ const usernamePattern = /^[a-zA-Z0-9_]{3,24}$/;
 let db;
 let httpServer;
 
-app.use(cors({ origin: env.server.clientOrigin }));
+function isAllowedOrigin(origin) {
+  if (!origin) {
+    return true;
+  }
+
+  if (origin === env.server.clientOrigin) {
+    return true;
+  }
+
+  try {
+    const url = new URL(origin);
+    const localHosts = new Set(['localhost', '127.0.0.1', '[::1]']);
+    return localHosts.has(url.hostname) && ['5173', '4173'].includes(url.port);
+  } catch {
+    return false;
+  }
+}
+
+app.use(cors({
+  origin(origin, callback) {
+    if (isAllowedOrigin(origin)) {
+      callback(null, true);
+      return;
+    }
+
+    callback(new Error(`CORS origin not allowed: ${origin}`));
+  },
+}));
 app.use(express.json({ limit: '32kb' }));
 
 app.use((request, _response, next) => {
@@ -124,6 +151,10 @@ function getFirebaseErrorMessage(error, fallback) {
     }
 
     return 'Firebase credentials loaded, but this service account does not have permission to read Firestore.';
+  }
+
+  if (String(error?.code) === '5' || message.includes('NOT_FOUND')) {
+    return 'Firebase credentials loaded, but the Firestore database was not found for project coverfi. Open Firebase Console, create a Cloud Firestore database in Native mode, then retry.';
   }
 
   return fallback;
