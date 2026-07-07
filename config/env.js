@@ -36,6 +36,7 @@ export const env = {
     apiKey: optionalString('DEEPSEEK_API_KEY'),
     baseUrl: optionalString('DEEPSEEK_BASE_URL', 'https://api.deepseek.com'),
     model: optionalString('DEEPSEEK_MODEL', 'deepseek-chat'),
+    researchModel: optionalString('DEEPSEEK_RESEARCH_MODEL', 'deepseek-research'),
     temperature: optionalNumber('DEEPSEEK_TEMPERATURE', 0.3),
     maxTokens: optionalNumber('DEEPSEEK_MAX_TOKENS', 700),
     timeoutMs: optionalNumber('DEEPSEEK_TIMEOUT_MS', 30000),

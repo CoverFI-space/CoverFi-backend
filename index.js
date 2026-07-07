@@ -126,9 +126,40 @@ function serializeChat(chat) {
   return {
     id: chat.id,
     walletAddress: chat.walletAddress,
+    mode: chat.mode || 'chat',
+    model: chat.model || '',
     message: chat.message,
     reply: chat.reply,
     createdAt: toIsoTimestamp(chat.createdAt),
+  };
+}
+
+function buildMarketContext(markets) {
+  if (!markets?.coins?.length) {
+    return null;
+  }
+
+  const importantSymbols = new Set(['XLM', 'USDC', 'USDT', 'PYUSD', 'EURC']);
+  const coins = markets.coins
+    .filter((coin, index) => index < 12 || importantSymbols.has(coin.symbol))
+    .slice(0, 20)
+    .map((coin) => ({
+      symbol: coin.symbol,
+      name: coin.name,
+      priceUsd: coin.currentPrice,
+      change1h: coin.priceChangePercentage1h,
+      change24h: coin.priceChangePercentage24h,
+      change7d: coin.priceChangePercentage7d,
+      high24h: coin.high24h,
+      low24h: coin.low24h,
+      lastUpdated: coin.lastUpdated,
+    }));
+
+  return {
+    provider: markets.provider,
+    currency: markets.currency,
+    lastFetchedAt: markets.lastFetchedAt,
+    coins,
   };
 }
 
@@ -425,24 +456,45 @@ app.post('/api/ai/chat', async (request, response) => {
   try {
     const message = String(request.body?.message || '').trim();
     const walletAddress = cleanWalletAddress(request.body?.walletAddress || '');
+    const mode = request.body?.mode === 'research' ? 'research' : 'chat';
+    const model = String(request.body?.model || '').trim();
+    const accountContext = request.body?.accountContext || null;
 
     if (!message) {
       return response.status(400).json({ message: 'Message is required.' });
     }
 
-    const reply = await createDeepSeekReply(message);
+    let marketContext = null;
+    try {
+      marketContext = buildMarketContext(await getPortfolioMarkets({ perPage: 20, page: 1 }));
+    } catch (error) {
+      logApiError('ai/chat/markets', error);
+      marketContext = {
+        provider: 'CoinGecko',
+        error: error?.message || 'Live prices are currently unavailable.',
+      };
+    }
+
+    const reply = await createDeepSeekReply(message, {
+      mode,
+      model,
+      accountContext,
+      marketContext,
+    });
 
     if (walletAddress) {
       const chats = await getChatsCollection();
       await chats.add({
         walletAddress,
+        mode,
+        model,
         message,
         reply,
         createdAt: admin.firestore.FieldValue.serverTimestamp(),
       });
     }
 
-    return response.json({ reply });
+    return response.json({ reply, mode, model, marketContext });
   } catch (error) {
     return response.status(error.statusCode || 500).json({
       message: getFirebaseErrorMessage(error, error.message || 'AI chat failed.'),
