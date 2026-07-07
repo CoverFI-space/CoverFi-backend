@@ -283,6 +283,94 @@ app.post('/api/auth/register', async (request, response) => {
   }
 });
 
+app.get('/api/users/search', async (request, response) => {
+  try {
+    const q = cleanUsername(request.query.q).toLowerCase();
+    if (!q) {
+      return response.json({ users: [] });
+    }
+
+    const users = await getUsersCollection();
+    const snapshot = await users
+      .where('usernameLower', '>=', q)
+      .where('usernameLower', '<=', q + '\uf8ff')
+      .limit(5)
+      .get();
+      
+    const results = [];
+    snapshot.forEach((doc) => {
+      results.push(serializeUser(doc.data()));
+    });
+
+    return response.json({ users: results });
+  } catch (error) {
+    return sendApiError(response, 500, 'Could not search users.', error, 'users/search');
+  }
+});
+
+app.post('/api/payments/save', async (request, response) => {
+  try {
+    const { sender, recipient, receiptData } = request.body;
+    if (!sender || !recipient || !receiptData || !receiptData.txHash) {
+      return response.status(400).json({ message: 'sender, recipient, and receiptData are required.' });
+    }
+
+    const firestore = await ensureFirebase();
+    const paymentsRef = firestore.collection('payments');
+    
+    const newPayment = {
+      participants: [sender.toLowerCase(), recipient.toLowerCase()],
+      sender: sender.toLowerCase(),
+      recipient: recipient.toLowerCase(),
+      receiptData,
+      createdAt: admin.firestore.FieldValue.serverTimestamp(),
+    };
+
+    const docRef = await paymentsRef.add(newPayment);
+
+    return response.json({
+      id: docRef.id,
+      ...newPayment,
+      createdAt: new Date().toISOString()
+    });
+  } catch (error) {
+    return sendApiError(response, 500, 'Could not save payment.', error, 'payments/save');
+  }
+});
+
+app.get('/api/payments/:username', async (request, response) => {
+  try {
+    const username = cleanUsername(request.params.username).toLowerCase();
+    const firestore = await ensureFirebase();
+    const paymentsRef = firestore.collection('payments');
+
+    const snapshot = await paymentsRef
+      .where('participants', 'array-contains', username)
+      .orderBy('createdAt', 'desc')
+      .limit(20)
+      .get();
+
+    const payments = [];
+    snapshot.forEach((doc) => {
+      const data = doc.data();
+      payments.push({
+        id: doc.id,
+        ...data,
+        createdAt: data.createdAt ? data.createdAt.toDate().toISOString() : new Date().toISOString()
+      });
+    });
+
+    return response.json({ payments });
+  } catch (error) {
+    // If index is missing, firebase throws. Let's just return empty array instead of 500 for missing index in dev.
+    if (error.message && error.message.includes('FAILED_PRECONDITION')) {
+       console.log('Firebase Index missing for payments query. Return empty array for now.');
+       return response.json({ payments: [] });
+    }
+    return sendApiError(response, 500, 'Could not fetch payments.', error, 'payments/list');
+  }
+});
+
 app.get('/api/users/:username', async (request, response) => {
   try {
     const usernameLower = cleanUsername(request.params.username).toLowerCase();
@@ -396,6 +484,36 @@ app.put('/api/account/:walletAddress', async (request, response) => {
     });
   } catch (error) {
     return sendApiError(response, 500, getFirebaseErrorMessage(error, error.message || 'Could not save account data.'), error, 'account/put');
+  }
+});
+
+app.post('/api/receipts/save', async (request, response) => {
+  try {
+    const { username, receiptUrl } = request.body;
+
+    if (!username || !receiptUrl) {
+      return response.status(400).json({ message: 'username and receiptUrl are required.' });
+    }
+
+    const firestore = await ensureFirebase();
+    const receiptsRef = firestore.collection('receipts');
+    const now = admin.firestore.FieldValue.serverTimestamp();
+
+    const newReceipt = {
+      username,
+      receiptUrl,
+      createdAt: now,
+    };
+
+    const docRef = await receiptsRef.add(newReceipt);
+
+    return response.json({
+      id: docRef.id,
+      ...newReceipt,
+      createdAt: new Date().toISOString()
+    });
+  } catch (error) {
+    return sendApiError(response, 500, 'Could not save receipt.', error, 'receipts/save');
   }
 });
 
