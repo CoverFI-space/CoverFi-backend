@@ -6,12 +6,21 @@
   "scripts": {
     "dev": "node --watch index.js",
     "start": "node index.js",
-    "check": "node --check index.js"
+    "check": "node --check index.js",
+    "test": "node --test",
+    "db:migrate": "node scripts/migrate.js",
+    "refresh:oracle": "node scripts/refresh-oracle.js",
+    "oracle:worker": "node scripts/oracle-worker.js",
+    "indexer:once": "node scripts/indexer-worker.js",
+    "indexer:worker": "node scripts/indexer-worker.js --loop",
+    "diagnose:protection": "node scripts/diagnose-protection.js",
+    "email:verify": "node scripts/verify-resend.js"
   },
   "dependencies": {
+    "@stellar/stellar-sdk": "^16.0.1",
     "cors": "^2.8.6",
     "dotenv": "^17.4.2",
     "express": "^5.2.1",
-    "firebase-admin": "^13.0.0"
+    "pg": "^8.16.3"
   }
 }

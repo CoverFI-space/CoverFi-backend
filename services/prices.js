@@ -32,6 +32,21 @@ export function getSupportedPriceAssets() {
   }));
 }
 
+function coingeckoFetchOptions(signal) {
+  const headers = {};
+  if (env.prices.coingeckoApiKey) {
+    const keyHeader = env.prices.coingeckoApiTier === 'pro'
+      ? 'x-cg-pro-api-key'
+      : 'x-cg-demo-api-key';
+    headers[keyHeader] = env.prices.coingeckoApiKey;
+  }
+
+  return {
+    signal,
+    ...(Object.keys(headers).length ? { headers } : {}),
+  };
+}
+
 export async function getUsdPriceForAsset(asset) {
   const symbol = normalizeAsset(asset);
   const feed = assetFeeds[symbol];
@@ -55,7 +70,7 @@ export async function getUsdPriceForAsset(asset) {
   url.searchParams.set('precision', 'full');
 
   try {
-    const apiResponse = await fetch(url, { signal: controller.signal });
+    const apiResponse = await fetch(url, coingeckoFetchOptions(controller.signal));
     const data = await apiResponse.json().catch(() => null);
 
     if (!apiResponse.ok) {
@@ -130,7 +145,7 @@ async function fetchMarkets(searchParams, signal) {
     url.searchParams.set(key, String(value));
   });
 
-  const apiResponse = await fetch(url, { signal });
+  const apiResponse = await fetch(url, coingeckoFetchOptions(signal));
   const data = await apiResponse.json().catch(() => null);
 
   if (!apiResponse.ok) {
