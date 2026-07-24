@@ -17,6 +17,11 @@ export function walletRef(walletAddress) {
 export function getConfiguredContractIds() {
   return Object.entries({
     protectionEngine: env.contracts.protectionEngine,
+    paymentLockEngine: env.contracts.paymentLockEngine,
+    paymentLockReserveVault: env.contracts.paymentLockReserveVault,
+    floorShieldEngine: env.contracts.floorShieldEngine,
+    floorShieldReserveVault: env.contracts.floorShieldReserveVault,
+    floorShieldProtectedVault: env.contracts.floorShieldProtectedVault,
     protectedBalanceVault: env.contracts.protectedBalanceVault,
     reserveVault: env.contracts.reserveVault,
     oracleAdapter: env.contracts.oracleAdapter,

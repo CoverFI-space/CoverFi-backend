@@ -2,9 +2,13 @@ import dotenv from 'dotenv';
 import crypto from 'crypto';
 import { fileURLToPath } from 'node:url';
 
-dotenv.config();
-
 const isProduction = process.env.NODE_ENV === 'production';
+
+// In development, a project .env should win over an old machine-level value.
+// In production, platform-managed environment variables (for example Azure App
+// Service settings) remain authoritative and are never overridden by a file.
+dotenv.config({ override: !isProduction });
+
 const shouldLoadFrontendEnv = !isProduction && process.env.LOAD_FRONTEND_ENV !== 'false';
 
 if (shouldLoadFrontendEnv) {
@@ -42,6 +46,16 @@ function getServerHost() {
   return host;
 }
 
+function getPasskeyRpId() {
+  const configured = optionalString('PASSKEY_RP_ID');
+  if (configured) return configured;
+  try {
+    return new URL(optionalString('CLIENT_ORIGIN', 'http://localhost:5173')).hostname;
+  } catch {
+    return 'localhost';
+  }
+}
+
 const configuredAuthSessionSecret = optionalString('AUTH_SESSION_SECRET');
 if (isProduction && !configuredAuthSessionSecret) {
   throw new Error('AUTH_SESSION_SECRET is required in production.');
@@ -67,20 +81,25 @@ export const env = {
     authIssuer: optionalString('AUTH_ISSUER', 'coverfi-api'),
     authAudience: optionalString('AUTH_AUDIENCE', 'coverfi-app'),
     authChallengeTtlMs: optionalNumber('AUTH_CHALLENGE_TTL_MS', 5 * 60 * 1000),
+    // Optional SEP-10-style signer used only for wallets that cannot sign
+    // arbitrary messages. It must be a dedicated Stellar key, never a treasury
+    // or contract-admin key.
+    authChallengeSignerSecret: optionalString('AUTH_CHALLENGE_SIGNER_SECRET'),
     authSessionTtlMs: optionalNumber('AUTH_SESSION_TTL_MS', 30 * 60 * 1000),
     privacyHmacSecret,
     trustedProxyHops: optionalNumber('TRUSTED_PROXY_HOPS', 0),
     requestTimeoutMs: optionalNumber('REQUEST_TIMEOUT_MS', 15_000),
     upstreamMaxBytes: optionalNumber('UPSTREAM_MAX_BYTES', 1_000_000),
   },
-  deepseek: {
-    apiKey: optionalString('DEEPSEEK_API_KEY'),
-    baseUrl: optionalString('DEEPSEEK_BASE_URL', 'https://api.deepseek.com'),
-    model: optionalString('DEEPSEEK_MODEL', 'deepseek-chat'),
-    researchModel: optionalString('DEEPSEEK_RESEARCH_MODEL', 'deepseek-research'),
-    temperature: optionalNumber('DEEPSEEK_TEMPERATURE', 0.3),
-    maxTokens: optionalNumber('DEEPSEEK_MAX_TOKENS', 700),
-    timeoutMs: optionalNumber('DEEPSEEK_TIMEOUT_MS', 30000),
+  azureOpenAi: {
+    endpoint: optionalString('AZURE_OPENAI_ENDPOINT'),
+    apiKey: optionalString('AZURE_OPENAI_API_KEY'),
+    apiVersion: optionalString('AZURE_OPENAI_API_VERSION', '2024-10-21'),
+    chatDeployment: optionalString('AZURE_OPENAI_CHAT_DEPLOYMENT', 'DeepSeek-V4-Flash'),
+    researchDeployment: optionalString('AZURE_OPENAI_RESEARCH_DEPLOYMENT', 'DeepSeek-V4-Pro'),
+    temperature: optionalNumber('AZURE_OPENAI_TEMPERATURE', 0.3),
+    maxTokens: optionalNumber('AZURE_OPENAI_MAX_TOKENS', 700),
+    timeoutMs: optionalNumber('AZURE_OPENAI_TIMEOUT_MS', 30000),
   },
   prices: {
     coingeckoBaseUrl: optionalString('COINGECKO_BASE_URL', 'https://api.coingecko.com'),
@@ -131,6 +150,14 @@ export const env = {
     tokenTtlMs: optionalNumber('ONBOARDING_TOKEN_TTL_MS', 30 * 60 * 1000),
     friendbotUrl: optionalString('STELLAR_TESTNET_FRIENDBOT_URL', 'https://friendbot.stellar.org'),
   },
+  passkeys: {
+    // WebAuthn credentials are bound to this exact relying-party domain and
+    // origin. Do not derive either from an incoming request header.
+    rpId: getPasskeyRpId(),
+    rpName: optionalString('PASSKEY_RP_NAME', 'CoverFi'),
+    origin: optionalString('PASSKEY_ORIGIN', optionalString('CLIENT_ORIGIN', 'http://localhost:5173')),
+    challengeTtlMs: optionalNumber('PASSKEY_CHALLENGE_TTL_MS', 5 * 60 * 1000),
+  },
   partners: {
     adminWallets: optionalStringList('PARTNER_ADMIN_WALLETS'),
     apiKeyPepper: optionalString('PARTNER_API_KEY_PEPPER', privacyHmacSecret),
@@ -159,6 +186,11 @@ export const env = {
     networkPassphrase: optionalString('STELLAR_NETWORK_PASSPHRASE', 'Test SDF Network ; September 2015'),
     statusSourceAccount: optionalString('STELLAR_STATUS_SOURCE_ACCOUNT', optionalString('VITE_DEPLOYMENT_SOURCE_ACCOUNT')),
     protectionEngine: optionalString('PROTECTION_ENGINE_CONTRACT_ID', optionalString('VITE_PROTECTION_ENGINE_CONTRACT_ID')),
+    paymentLockEngine: optionalString('PAYMENT_LOCK_ENGINE_CONTRACT_ID', optionalString('VITE_PAYMENT_LOCK_ENGINE_CONTRACT_ID')),
+    paymentLockReserveVault: optionalString('PAYMENT_LOCK_RESERVE_VAULT_CONTRACT_ID', optionalString('VITE_PAYMENT_LOCK_RESERVE_VAULT_CONTRACT_ID')),
+    floorShieldEngine: optionalString('FLOOR_SHIELD_ENGINE_CONTRACT_ID', optionalString('VITE_FLOOR_SHIELD_ENGINE_CONTRACT_ID')),
+    floorShieldReserveVault: optionalString('FLOOR_SHIELD_RESERVE_VAULT_CONTRACT_ID', optionalString('VITE_FLOOR_SHIELD_RESERVE_VAULT_CONTRACT_ID')),
+    floorShieldProtectedVault: optionalString('FLOOR_SHIELD_PROTECTED_VAULT_CONTRACT_ID', optionalString('VITE_FLOOR_SHIELD_PROTECTED_VAULT_CONTRACT_ID')),
     protectedBalanceVault: optionalString('PROTECTED_BALANCE_VAULT_CONTRACT_ID', optionalString('VITE_PROTECTED_BALANCE_VAULT_CONTRACT_ID')),
     reserveVault: optionalString('RESERVE_VAULT_CONTRACT_ID', optionalString('VITE_RESERVE_VAULT_CONTRACT_ID')),
     oracleAdapter: optionalString('ORACLE_ADAPTER_CONTRACT_ID', optionalString('VITE_ORACLE_ADAPTER_CONTRACT_ID')),
@@ -173,6 +205,6 @@ export const env = {
   },
 };
 
-export function isDeepSeekConfigured() {
-  return Boolean(env.deepseek.apiKey);
+export function isAzureOpenAiConfigured() {
+  return Boolean(env.azureOpenAi.endpoint && env.azureOpenAi.apiKey);
 }

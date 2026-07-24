@@ -382,13 +382,20 @@ export async function startEmailOtp(email) {
   const nonce = crypto.randomBytes(18).toString('base64url');
   const emailHash = emailRef(normalizedEmail);
   const expiresAt = Date.now() + env.onboarding.otpTtlMs;
-  const provider = await sendOtpEmail(normalizedEmail, otp);
   const record = await saveOtpRecord({
     emailHash,
     nonce,
     otpHash: otpHash(emailHash, nonce, otp),
     expiresAt,
   });
+  let provider;
+  try {
+    provider = await sendOtpEmail(normalizedEmail, otp);
+  } catch (error) {
+    // Never leave a usable code behind when its delivery failed.
+    await updateOtpRecord(record, { status: 'expired', attempts: record.attempts || 0 }).catch(() => undefined);
+    throw error;
+  }
 
   return {
     otpId: record.id,

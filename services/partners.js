@@ -241,6 +241,7 @@ export async function createPartnerWebhook(input) {
     .createHmac('sha256', env.partners.apiKeyPepper)
     .update(`partner-webhook:${secret}`)
     .digest('hex');
+  const secretCiphertext = encryptWebhookSecret(secret);
   const eventTypes = Array.isArray(input.eventTypes) && input.eventTypes.length
     ? input.eventTypes.map(String)
     : [
@@ -252,17 +253,69 @@ export async function createPartnerWebhook(input) {
       'reserve.utilization_changed',
       'oracle.stale',
       'oracle.recovered',
+      'payment_lock.created',
+      'payment_lock.awaiting_oracle',
+      'payment_lock.settled',
+      'payment_lock.payout_paid',
+      'invoice.issued',
+      'invoice.protected',
+      'invoice.settled',
+      'invoice.payout_paid',
+      'floor_shield.created',
+      'floor_shield.awaiting_oracle',
+      'floor_shield.settled',
+      'floor_shield.payout_paid',
     ];
   const result = await query(
-    `INSERT INTO partner_webhooks (partner_id, url, secret_hash, event_types)
-     VALUES ($1, $2, $3, $4)
+    `INSERT INTO partner_webhooks (partner_id, url, secret_hash, secret_ciphertext, event_types)
+     VALUES ($1, $2, $3, $4, $5)
      RETURNING id, partner_id, url, event_types, active, created_at`,
-    [input.partnerId, input.url, secretHash, eventTypes],
+    [input.partnerId, input.url, secretHash, secretCiphertext, eventTypes],
   );
   return {
     ...result.rows[0],
     secret,
   };
+}
+
+function webhookCipherKey() {
+  return crypto.createHash('sha256').update(`coverfi-webhook:${env.server.authSessionSecret}`).digest();
+}
+
+function encryptWebhookSecret(secret) {
+  const iv = crypto.randomBytes(12);
+  const cipher = crypto.createCipheriv('aes-256-gcm', webhookCipherKey(), iv);
+  const encrypted = Buffer.concat([cipher.update(secret, 'utf8'), cipher.final()]);
+  return `${iv.toString('base64url')}.${cipher.getAuthTag().toString('base64url')}.${encrypted.toString('base64url')}`;
+}
+
+export function decryptWebhookSecret(ciphertext) {
+  const [ivText, tagText, bodyText] = String(ciphertext || '').split('.');
+  if (!ivText || !tagText || !bodyText) return '';
+  try {
+    const decipher = crypto.createDecipheriv('aes-256-gcm', webhookCipherKey(), Buffer.from(ivText, 'base64url'));
+    decipher.setAuthTag(Buffer.from(tagText, 'base64url'));
+    return Buffer.concat([decipher.update(Buffer.from(bodyText, 'base64url')), decipher.final()]).toString('utf8');
+  } catch {
+    return '';
+  }
+}
+
+export async function enqueuePartnerWebhookDeliveries(input) {
+  if (!input.partnerId || !input.eventType) return 0;
+  const hooks = await query(
+    `SELECT id FROM partner_webhooks
+     WHERE partner_id=$1 AND active=true AND $2 = ANY(event_types)`,
+    [input.partnerId, input.eventType],
+  );
+  for (const webhook of hooks.rows) {
+    await query(
+      `INSERT INTO webhook_deliveries (webhook_id, delivery_id, event_type, payload, status, next_attempt_at)
+       VALUES ($1,$2,$3,$4,'pending',now())`,
+      [webhook.id, crypto.randomUUID(), input.eventType, input.payload || {}],
+    );
+  }
+  return hooks.rows.length;
 }
 
 export async function authenticatePartnerApiKey(headerValue, requiredScope) {

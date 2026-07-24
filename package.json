@@ -13,10 +13,13 @@
     "oracle:worker": "node scripts/oracle-worker.js",
     "indexer:once": "node scripts/indexer-worker.js",
     "indexer:worker": "node scripts/indexer-worker.js --loop",
+    "webhooks:once": "node scripts/webhook-worker.js",
+    "webhooks:worker": "node scripts/webhook-worker.js --loop",
     "diagnose:protection": "node scripts/diagnose-protection.js",
     "email:verify": "node scripts/verify-resend.js"
   },
   "dependencies": {
+    "@simplewebauthn/server": "^13.3.2",
     "@stellar/stellar-sdk": "15.1.0",
     "cors": "^2.8.6",
     "dotenv": "^17.4.2",

@@ -92,7 +92,6 @@ function normalizeRpcEvent(event, contractId) {
     payload: {
       topic: event.topic || event.topics || [],
       value: event.value || event.data || null,
-      raw: event,
     },
   };
 }

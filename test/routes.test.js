@@ -1,13 +1,14 @@
 import assert from 'node:assert/strict';
 import crypto from 'node:crypto';
 import { after, before, test } from 'node:test';
-import { Keypair } from '@stellar/stellar-sdk';
+import { Keypair, Networks, TransactionBuilder } from '@stellar/stellar-sdk';
 
 process.env.NODE_ENV = 'test';
 process.env.DATABASE_URL = '';
 process.env.DATABASE_SSL = 'false';
 process.env.TESTNET_RESERVE_ATTESTATION_SECRET = '';
 process.env.TESTNET_RESERVE_ATTESTATION_PUBLIC_KEY = '';
+process.env.AUTH_CHALLENGE_SIGNER_SECRET = Keypair.random().secret();
 
 const { app } = await import('../index.js');
 
@@ -183,6 +184,46 @@ test('wallet auth challenge verifies a Freighter SEP-53 signature', async () => 
   assert.equal(sessionResponse.status, 200);
   assert.equal(session.walletAddress, walletAddress);
   assert.equal(typeof session.token, 'string');
+});
+
+test('transaction authentication verifies a signed non-submittable challenge once', async () => {
+  const keypair = Keypair.random();
+  const walletAddress = keypair.publicKey();
+  const challengeResponse = await fetch(`${baseUrl}/api/auth/transaction-challenge`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ walletAddress }),
+  });
+  const challenge = await challengeResponse.json();
+  assert.equal(challengeResponse.status, 200);
+
+  const transaction = TransactionBuilder.fromXDR(challenge.xdr, Networks.TESTNET);
+  assert.equal(transaction.sequence, '0');
+  transaction.sign(keypair);
+
+  const sessionResponse = await fetch(`${baseUrl}/api/auth/transaction-session`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      walletAddress,
+      nonce: challenge.nonce,
+      signedTxXdr: transaction.toXDR(),
+    }),
+  });
+  const session = await sessionResponse.json();
+  assert.equal(sessionResponse.status, 200);
+  assert.equal(typeof session.token, 'string');
+
+  const replayResponse = await fetch(`${baseUrl}/api/auth/transaction-session`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      walletAddress,
+      nonce: challenge.nonce,
+      signedTxXdr: transaction.toXDR(),
+    }),
+  });
+  assert.equal(replayResponse.status, 401);
 });
 
 test('zk proof status returns wallet verified proof events after signed session', async () => {

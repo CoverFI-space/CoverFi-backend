@@ -4,17 +4,19 @@ import express from 'express';
 import { execFile } from 'node:child_process';
 import {
   Address,
+  Account,
   BASE_FEE,
   Contract,
   Keypair,
+  Operation,
   nativeToScVal,
   TransactionBuilder,
   rpc,
   scValToNative,
 } from '@stellar/stellar-sdk';
-import { env, isDeepSeekConfigured } from './config/env.js';
+import { env, isAzureOpenAiConfigured } from './config/env.js';
 import { isDatabaseConfigured, query as dbQuery } from './services/database.js';
-import { createDeepSeekReply, getCoverFiResearchContext } from './services/deepseek.js';
+import { createAzureOpenAiReply, getCoverFiResearchContext } from './services/azure-ai.js';
 import {
   DIDIT_KYB_WORKFLOW_ID,
   DIDIT_KYC_WORKFLOW_ID,
@@ -41,6 +43,7 @@ import {
   createPartnerQuote,
   createPartnerSession,
   createPartnerWebhook,
+  enqueuePartnerWebhookDeliveries,
   getPartnerOwnedByWallet,
   getPartnerMetrics,
   getPartnerPosition,
@@ -67,14 +70,30 @@ import {
   verifyEmailOtp,
   verifyEmailMfa,
   verifyEmailSessionToken,
+  emailRef,
+  isValidEmail,
+  createEmailSessionToken,
   walletRef as onboardingWalletRef,
 } from './services/onboarding.js';
+import {
+  createPasskeyAuthenticationOptions,
+  createPasskeyRegistrationOptions,
+  verifyPasskeyAuthentication,
+  verifyPasskeyRegistration,
+} from './services/passkeys.js';
 import {
   getIndexerStatus,
   listWalletActivity,
   listWalletEvents,
 } from './services/history.js';
 import { getPortfolioMarkets, getSupportedPriceAssets, getUsdPriceForAsset } from './services/prices.js';
+import {
+  createPaymentInvoice,
+  getPublicPaymentInvoice,
+  listNotifications,
+  markPaymentInvoice,
+  queueNotification,
+} from './services/value-protection.js';
 
 const app = express();
 const usernamePattern = /^[a-zA-Z0-9_]{3,24}$/;
@@ -1097,6 +1116,51 @@ function verifyWalletSignature(walletAddress, message, signature) {
   }
 }
 
+async function createTransactionAuthChallenge(walletAddress, nonce, expiresAt) {
+  if (!env.server.authChallengeSignerSecret) {
+    const error = new Error('This wallet requires transaction-based authentication, which is not configured yet. Use a wallet with message signing or contact CoverFi support.');
+    error.statusCode = 503;
+    throw error;
+  }
+  let serverSigner;
+  try {
+    serverSigner = Keypair.fromSecret(env.server.authChallengeSignerSecret);
+  } catch {
+    const error = new Error('Transaction authentication signer is invalid.');
+    error.statusCode = 500;
+    throw error;
+  }
+
+  // SEP-10-style challenge envelope: source sequence zero keeps it invalid for
+  // submission, while the server signature proves the request came from CoverFi.
+  const transaction = new TransactionBuilder(new Account(serverSigner.publicKey(), '-1'), {
+    fee: String(BASE_FEE),
+    networkPassphrase: env.contracts.networkPassphrase,
+  })
+    .addOperation(Operation.manageData({ name: 'web_auth_domain', value: env.passkeys.rpId }))
+    .addOperation(Operation.manageData({ name: 'coverfi-auth', value: nonce }))
+    .setTimeout(Math.max(1, Math.ceil((expiresAt - Date.now()) / 1000)))
+    .build();
+  transaction.sign(serverSigner);
+
+  return {
+    xdr: transaction.toXDR(),
+    transactionHash: transaction.hash().toString('hex'),
+  };
+}
+
+function verifyTransactionAuthSignature(walletAddress, signedTxXdr, expectedHash) {
+  try {
+    const transaction = TransactionBuilder.fromXDR(signedTxXdr, env.contracts.networkPassphrase);
+    const hash = transaction.hash();
+    if (hash.toString('hex') !== expectedHash) return false;
+    const keypair = Keypair.fromPublicKey(walletAddress);
+    return transaction.signatures.some((signature) => keypair.verify(hash, signature.signature()));
+  } catch {
+    return false;
+  }
+}
+
 function verifyWalletSignatureBuffer(walletAddress, messageBuffer, signature) {
   try {
     const keypair = Keypair.fromPublicKey(walletAddress);
@@ -1635,7 +1699,7 @@ function sendApiError(response, status, message, error, context) {
 app.get('/api/health', async (_request, response) => {
   response.json({
     ok: true,
-    aiConfigured: isDeepSeekConfigured(),
+    aiConfigured: isAzureOpenAiConfigured(),
     accountStorage: 'browser_encrypted_indexeddb',
     receiptStorage: 'browser_encrypted_indexeddb',
     analyticsWalletStorage: 'hmac_only',
@@ -2155,6 +2219,132 @@ app.post('/api/onboarding/email/mfa/verify', async (request, response) => {
     });
   } catch (error) {
     return sendApiError(response, error.statusCode || 500, error.message || 'Could not verify authenticator code.', error, 'onboarding/email/mfa/verify');
+  }
+});
+
+app.post('/api/auth/transaction-challenge', async (request, response) => {
+  try {
+    if (!isPlainObject(request.body)) {
+      return response.status(400).json({ message: 'Request body must be a JSON object.' });
+    }
+    const walletAddress = cleanWalletAddress(request.body.walletAddress);
+    if (!isValidWalletAddress(walletAddress)) {
+      return response.status(400).json({ message: 'A valid Stellar wallet address is required.' });
+    }
+    const nonce = crypto.randomBytes(24).toString('base64url');
+    const expiresAt = Date.now() + env.server.authChallengeTtlMs;
+    const transaction = await createTransactionAuthChallenge(walletAddress, nonce, expiresAt);
+    authChallenges.set(challengeKey(walletAddress, nonce), {
+      walletAddress,
+      nonce,
+      expiresAt,
+      type: 'transaction',
+      transactionHash: transaction.transactionHash,
+    });
+    return response.json({
+      walletAddress,
+      nonce,
+      xdr: transaction.xdr,
+      expiresAt: new Date(expiresAt).toISOString(),
+    });
+  } catch (error) {
+    return sendApiError(response, error.statusCode || 500, error.message || 'Could not create wallet authentication request.', error, 'auth/transaction-challenge');
+  }
+});
+
+app.post('/api/auth/transaction-session', (request, response) => {
+  if (!isPlainObject(request.body)) {
+    return response.status(400).json({ message: 'Request body must be a JSON object.' });
+  }
+  const walletAddress = cleanWalletAddress(request.body.walletAddress);
+  const nonce = cleanShortString(request.body.nonce, 120);
+  const signedTxXdr = cleanShortString(request.body.signedTxXdr, 200_000);
+  if (!isValidWalletAddress(walletAddress) || !nonce || !signedTxXdr) {
+    return response.status(400).json({ message: 'Wallet, nonce, and signed transaction are required.' });
+  }
+  const key = challengeKey(walletAddress, nonce);
+  const challenge = authChallenges.get(key);
+  authChallenges.delete(key);
+  if (!challenge || challenge.type !== 'transaction' || challenge.expiresAt <= Date.now()) {
+    return response.status(401).json({ message: 'Wallet authentication request is missing or expired.' });
+  }
+  if (!verifyTransactionAuthSignature(walletAddress, signedTxXdr, challenge.transactionHash)) {
+    return response.status(401).json({ message: 'Wallet transaction signature could not be verified.' });
+  }
+  return response.json({
+    walletAddress,
+    token: createSessionToken(walletAddress),
+    expiresAt: new Date(Date.now() + env.server.authSessionTtlMs).toISOString(),
+  });
+});
+
+app.post('/api/onboarding/passkeys/registration/options', async (request, response) => {
+  try {
+    const emailSession = requireEmailSession(request, response);
+    if (!emailSession) return null;
+    if (!isPlainObject(request.body)) {
+      return response.status(400).json({ message: 'Request body must be a JSON object.' });
+    }
+    const result = await createPasskeyRegistrationOptions({
+      emailHash: emailSession.emailHash,
+      label: cleanShortString(request.body.label, 80),
+    });
+    return response.json(result);
+  } catch (error) {
+    return sendApiError(response, error.statusCode || 500, error.message || 'Could not start passkey setup.', error, 'onboarding/passkeys/registration/options');
+  }
+});
+
+app.post('/api/onboarding/passkeys/registration/verify', async (request, response) => {
+  try {
+    const emailSession = requireEmailSession(request, response);
+    if (!emailSession) return null;
+    if (!isPlainObject(request.body)) {
+      return response.status(400).json({ message: 'Request body must be a JSON object.' });
+    }
+    const result = await verifyPasskeyRegistration({
+      emailHash: emailSession.emailHash,
+      challengeId: cleanShortString(request.body.challengeId, 80),
+      response: request.body.response,
+    });
+    return response.status(201).json({ verified: true, passkey: result });
+  } catch (error) {
+    return sendApiError(response, error.statusCode || 500, error.message || 'Could not verify passkey.', error, 'onboarding/passkeys/registration/verify');
+  }
+});
+
+app.post('/api/onboarding/passkeys/authentication/options', async (request, response) => {
+  try {
+    if (!isPlainObject(request.body) || !isValidEmail(request.body.email)) {
+      return response.status(400).json({ message: 'A valid email is required.' });
+    }
+    const result = await createPasskeyAuthenticationOptions({
+      emailHash: emailRef(request.body.email),
+    });
+    return response.json(result);
+  } catch (error) {
+    return sendApiError(response, error.statusCode || 500, error.message || 'Could not start passkey sign-in.', error, 'onboarding/passkeys/authentication/options');
+  }
+});
+
+app.post('/api/onboarding/passkeys/authentication/verify', async (request, response) => {
+  try {
+    if (!isPlainObject(request.body) || !isValidEmail(request.body.email)) {
+      return response.status(400).json({ message: 'A valid email is required.' });
+    }
+    const emailHash = emailRef(request.body.email);
+    await verifyPasskeyAuthentication({
+      emailHash,
+      challengeId: cleanShortString(request.body.challengeId, 80),
+      response: request.body.response,
+    });
+    return response.json({
+      verified: true,
+      token: createEmailSessionToken(emailHash),
+      expiresAt: new Date(Date.now() + env.onboarding.tokenTtlMs).toISOString(),
+    });
+  } catch (error) {
+    return sendApiError(response, error.statusCode || 500, error.message || 'Could not verify passkey sign-in.', error, 'onboarding/passkeys/authentication/verify');
   }
 });
 
@@ -3756,6 +3946,122 @@ app.post('/api/partners/transaction-drafts/protection', async (request, response
   }
 });
 
+app.post('/api/partners/payment-locks/quote', async (request, response) => {
+  try {
+    const partner = await requirePartnerApiSession(request, response, 'quote:read');
+    if (!partner) return null;
+    if (!env.contracts.paymentLockEngine) return response.status(503).json({ message: 'Payment Lock is not deployed for this network.' });
+    const amount = decimalToStroops(request.body?.paymentAmount);
+    const durationSeconds = Number(request.body?.durationSeconds);
+    if (!amount || amount <= 0n || ![900, 3600, 86400].includes(durationSeconds)) {
+      return response.status(400).json({ message: 'paymentAmount and a 15 minute, 1 hour, or 24 hour duration are required.' });
+    }
+    const quote = await simulateContractRead(env.contracts.paymentLockEngine, 'quote_lock', [
+      nativeToScVal(amount, { type: 'i128' }), nativeToScVal(BigInt(durationSeconds), { type: 'u64' }),
+    ]);
+    return response.json({ product: 'payment_lock', quote: serializeQuote(quote), durationSeconds, walletSignatureRequired: true, testnetOnly: env.contracts.network !== 'mainnet' });
+  } catch (error) {
+    return sendApiError(response, error.statusCode || 502, error.message || 'Could not quote Payment Lock.', error, 'payment-lock/quote');
+  }
+});
+
+app.post('/api/partners/payment-locks/draft', async (request, response) => {
+  try {
+    const partner = await requirePartnerApiSession(request, response, 'tx:build');
+    if (!partner) return null;
+    if (!env.contracts.paymentLockEngine) return response.status(503).json({ message: 'Payment Lock is not deployed for this network.' });
+    const sender = cleanWalletAddress(request.body?.sender);
+    const recipient = cleanWalletAddress(request.body?.recipient);
+    const amount = decimalToStroops(request.body?.paymentAmount);
+    const durationSeconds = Number(request.body?.durationSeconds);
+    const referenceHash = cleanShortString(request.body?.referenceHash || '', 64).toLowerCase();
+    if (!isValidWalletAddress(sender) || !isValidWalletAddress(recipient) || sender === recipient || !amount || amount <= 0n || ![900, 3600, 86400].includes(durationSeconds)) {
+      return response.status(400).json({ message: 'Valid sender, recipient, paymentAmount, and Rate Lock duration are required.' });
+    }
+    if (referenceHash && !receiptHashPattern.test(referenceHash)) return response.status(400).json({ message: 'referenceHash must be a SHA-256 hex digest.' });
+    return response.json({
+      draft: { network: env.contracts.network, networkPassphrase: env.contracts.networkPassphrase, contractId: env.contracts.paymentLockEngine, method: 'create_lock', args: [
+        { type: 'address', value: sender }, { type: 'address', value: recipient }, { type: 'i128', value: amount.toString() }, { type: 'u64', value: String(durationSeconds) },
+        { type: 'option<bytesN<32>>', value: referenceHash || null }, { type: 'option<address>', value: null },
+      ], submitter: 'user_wallet' },
+      partner: { id: partner.partner_id, slug: partner.slug },
+      warning: 'Payment Lock sends the payment directly to the recipient and only the recipient can receive any automatic value-protection payout.',
+    });
+  } catch (error) {
+    return sendApiError(response, error.statusCode || 500, error.message || 'Could not build Payment Lock draft.', error, 'payment-lock/draft');
+  }
+});
+
+app.post('/api/partners/invoices', async (request, response) => {
+  try {
+    const partner = await requirePartnerApiSession(request, response, 'tx:build');
+    if (!partner) return null;
+    const merchantWallet = cleanWalletAddress(request.body?.merchantWallet || partner.onchain_partner_address || '');
+    const amount = decimalToStroops(request.body?.amount);
+    const durationSeconds = Number(request.body?.durationSeconds || 3600);
+    const expiresAt = new Date(String(request.body?.expiresAt || ''));
+    const assetContractId = cleanShortString(request.body?.assetContractId || env.contracts.xlmToken, 80);
+    const payoutAssetContractId = cleanShortString(request.body?.payoutAssetContractId || env.contracts.payoutToken, 80);
+    if (!isValidWalletAddress(merchantWallet) || !amount || amount <= 0n || ![900, 3600, 86400].includes(durationSeconds) || !Number.isFinite(expiresAt.getTime()) || expiresAt.getTime() <= Date.now() || !assetContractId || !payoutAssetContractId) {
+      return response.status(400).json({ message: 'Valid merchant wallet, amount, assets, future expiry, and Rate Lock duration are required.' });
+    }
+    const created = await createPaymentInvoice({ partnerId: partner.partner_id, merchantWallet, amountStroops: amount, durationSeconds, expiresAt: expiresAt.toISOString(), assetContractId, payoutAssetContractId });
+    await enqueuePartnerWebhookDeliveries({ partnerId: partner.partner_id, eventType: 'invoice.issued', payload: { invoiceHash: created.invoice.invoice_hash, amountStroops: String(amount), expiresAt: expiresAt.toISOString() } });
+    return response.status(201).json({ invoice: created.invoice, paymentUrl: `${env.server.clientOrigin.replace(/\/$/, '')}/invoice/${created.publicToken}`, publicToken: created.publicToken });
+  } catch (error) {
+    return sendApiError(response, error.statusCode || 500, error.message || 'Could not create protected invoice.', error, 'invoices/create');
+  }
+});
+
+app.get('/api/invoices/:token', async (request, response) => {
+  try {
+    const invoice = await getPublicPaymentInvoice(cleanShortString(request.params.token, 120));
+    if (!invoice) return response.status(404).json({ message: 'Invoice not found or expired.' });
+    await markPaymentInvoice({ invoiceId: invoice.id, status: 'opened' });
+    return response.json({ invoice: { invoiceHash: invoice.invoice_hash, merchantWallet: invoice.merchant_wallet, assetContractId: invoice.asset_contract_id, payoutAssetContractId: invoice.payout_asset_contract_id, amountStroops: invoice.amount_stroops, durationSeconds: invoice.rate_lock_duration_seconds, expiresAt: invoice.expires_at, status: invoice.status } });
+  } catch (error) {
+    return sendApiError(response, error.statusCode || 500, error.message || 'Could not read protected invoice.', error, 'invoices/public');
+  }
+});
+
+app.post('/api/invoices/:token/submitted', async (request, response) => {
+  try {
+    const customerWallet = cleanWalletAddress(request.body?.customerWallet);
+    const paymentLockId = cleanShortString(request.body?.paymentLockId || '', 100);
+    const transactionHash = cleanShortString(request.body?.transactionHash || '', 64);
+    if (!isValidWalletAddress(customerWallet) || (!paymentLockId && !txHashPattern.test(transactionHash))) {
+      return response.status(400).json({ message: 'Valid customerWallet and a payment lock ID or transaction hash are required.' });
+    }
+    if (!requireWalletSession(request, response, customerWallet)) return null;
+    const invoice = await getPublicPaymentInvoice(cleanShortString(request.params.token, 120));
+    if (!invoice) return response.status(404).json({ message: 'Invoice not found or expired.' });
+    if (invoice.status === 'protected' || invoice.status === 'settled' || invoice.status === 'payout_paid') {
+      return response.status(409).json({ message: 'This invoice has already been submitted.' });
+    }
+    const updated = await markPaymentInvoice({
+      invoiceId: invoice.id,
+      status: 'protected',
+      paymentLockId: paymentLockId || transactionHash,
+      customerWalletRef: walletLogRef(customerWallet),
+    });
+    await queueNotification({
+      walletRef: walletLogRef(customerWallet),
+      eventType: 'payment_lock.created',
+      payload: { paymentLockId: paymentLockId || transactionHash, product: 'rate_lock' },
+    });
+    await enqueuePartnerWebhookDeliveries({ partnerId: invoice.partner_id, eventType: 'invoice.protected', payload: { invoiceHash: invoice.invoice_hash, paymentLockId: paymentLockId || transactionHash } });
+    return response.json({ invoice: updated });
+  } catch (error) {
+    return sendApiError(response, error.statusCode || 500, error.message || 'Could not update protected invoice.', error, 'invoices/submitted');
+  }
+});
+
+app.get('/api/notifications/:walletAddress', async (request, response) => {
+  const walletAddress = cleanWalletAddress(request.params.walletAddress);
+  if (!requireWalletSession(request, response, walletAddress)) return null;
+  return response.json({ notifications: await listNotifications(walletLogRef(walletAddress), request.query.limit) });
+});
+
 app.post('/api/partners/webhooks', async (request, response) => {
   try {
     const partner = await requirePartnerApiSession(request, response, 'webhooks:write');
@@ -3893,7 +4199,7 @@ app.post('/api/ai/chat', async (request, response) => {
       ? await getCoverFiResearchContext()
       : null;
 
-    const reply = await createDeepSeekReply(message, {
+    const reply = await createAzureOpenAiReply(message, {
       mode,
       model,
       accountContext,
@@ -3945,7 +4251,7 @@ export function startServer() {
   httpServer = app.listen(env.server.port, env.server.host, async () => {
     writeLog('info', 'server_started', {
       url: `http://${env.server.host}:${env.server.port}`,
-      aiConfigured: isDeepSeekConfigured(),
+      aiConfigured: isAzureOpenAiConfigured(),
       backendProductDatabase: false,
     });
   });
