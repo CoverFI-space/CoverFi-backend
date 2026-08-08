@@ -1,15 +1,28 @@
 import dotenv from 'dotenv';
 import crypto from 'crypto';
 import { fileURLToPath } from 'node:url';
+import path from 'node:path';
 
 const isProduction = process.env.NODE_ENV === 'production';
+const isTest = process.env.NODE_ENV === 'test';
+const oracleEntrypoints = new Set([
+  'oracle-worker.js',
+  'testnet-oracle-worker.js',
+  'refresh-oracle.js',
+  'validate-mainnet-oracle-config.js',
+]);
+const isOracleProcess = oracleEntrypoints.has(path.basename(process.argv[1] || ''));
 
 // In development, a project .env should win over an old machine-level value.
 // In production, platform-managed environment variables (for example Azure App
 // Service settings) remain authoritative and are never overridden by a file.
-dotenv.config({ override: !isProduction });
+// Tests must also remain isolated: an engineer's local .env cannot replace
+// explicit test values or point a test suite at a real database.
+if (!isTest) {
+  dotenv.config({ override: !isProduction });
+}
 
-const shouldLoadFrontendEnv = !isProduction && process.env.LOAD_FRONTEND_ENV !== 'false';
+const shouldLoadFrontendEnv = !isProduction && !isTest && process.env.LOAD_FRONTEND_ENV !== 'false';
 
 if (shouldLoadFrontendEnv) {
   dotenv.config({
@@ -57,14 +70,14 @@ function getPasskeyRpId() {
 }
 
 const configuredAuthSessionSecret = optionalString('AUTH_SESSION_SECRET');
-if (isProduction && !configuredAuthSessionSecret) {
+if (isProduction && !isOracleProcess && !configuredAuthSessionSecret) {
   throw new Error('AUTH_SESSION_SECRET is required in production.');
 }
 
 const authSessionSecret = configuredAuthSessionSecret
   || crypto.randomBytes(32).toString('hex');
 const configuredPrivacyHmacSecret = optionalString('PRIVACY_HMAC_SECRET');
-if (isProduction && !configuredPrivacyHmacSecret) {
+if (isProduction && !isOracleProcess && !configuredPrivacyHmacSecret) {
   throw new Error('PRIVACY_HMAC_SECRET is required in production.');
 }
 const privacyHmacSecret = configuredPrivacyHmacSecret || authSessionSecret;
@@ -77,6 +90,7 @@ export const env = {
     clientOrigin: optionalString('CLIENT_ORIGIN', 'http://localhost:5173'),
     clientOrigins: optionalStringList('CLIENT_ORIGINS'),
     termsVersion: optionalString('TERMS_VERSION', '2026-07-16'),
+    mainnetPublicLaunchEnabled: optionalString('MAINNET_PUBLIC_LAUNCH_ENABLED', 'false').toLowerCase() === 'true',
     authSessionSecret,
     authIssuer: optionalString('AUTH_ISSUER', 'coverfi-api'),
     authAudience: optionalString('AUTH_AUDIENCE', 'coverfi-app'),
@@ -105,13 +119,43 @@ export const env = {
     coingeckoBaseUrl: optionalString('COINGECKO_BASE_URL', 'https://api.coingecko.com'),
     coingeckoApiKey: optionalString('COINGECKO_API_KEY'),
     coingeckoApiTier: optionalString('COINGECKO_API_TIER', 'demo'),
+    // Disabled for the CoinGecko-only temporary price flow:
+    // cryptoCompareBaseUrl: optionalString('CRYPTOCOMPARE_BASE_URL', 'https://min-api.cryptocompare.com'),
+    // cryptoCompareApiKey: optionalString('CRYPTOCOMPARE_API_KEY'),
+    // coinbaseBaseUrl: optionalString('COINBASE_MARKET_DATA_BASE_URL', 'https://api.coinbase.com'),
     cacheMs: optionalNumber('PRICE_CACHE_MS', 30000),
     timeoutMs: optionalNumber('PRICE_TIMEOUT_MS', 12000),
   },
   oracle: {
-    // This can only enable a separately authenticated testnet maintenance route.
-    // It must remain false for normal deployments and mainnet operations.
+    // Enables the bounded Testnet CoinGecko refresh route. The server fetches
+    // the value itself and signs with the configured publisher keys.
     automaticRefreshEnabled: optionalString('ENABLE_TESTNET_ORACLE_REFRESH', 'false').toLowerCase() === 'true',
+    publisher1Secret: optionalString('ORACLE_PUBLISHER_1_SECRET'),
+    publisher2Secret: optionalString('ORACLE_PUBLISHER_2_SECRET'),
+    publisher3Secret: optionalString('ORACLE_PUBLISHER_3_SECRET'),
+    publisher1PublicKey: optionalString('ORACLE_PUBLISHER_1_PUBLIC_KEY'),
+    publisher2PublicKey: optionalString('ORACLE_PUBLISHER_2_PUBLIC_KEY'),
+    publisher3PublicKey: optionalString('ORACLE_PUBLISHER_3_PUBLIC_KEY'),
+    quorumSourceContractId: optionalString('QUORUM_ORACLE_SOURCE_CONTRACT_ID'),
+    // This is a separate, explicit production gate. A Mainnet worker cannot
+    // start merely because the general Testnet switch was enabled.
+    mainnetQuorumPublishingEnabled: optionalString('ENABLE_MAINNET_QUORUM_ORACLE_PUBLISHING', 'false').toLowerCase() === 'true',
+    // Retained for the former multi-source implementation; the temporary
+    // flow is always CoinGecko-only regardless of this setting.
+    // mainnetSingleSourceDemoEnabled: optionalString('MAINNET_ORACLE_SINGLE_SOURCE_DEMO_MODE', 'false').toLowerCase() === 'true',
+    // Enables bounded browser requests to the configured Mainnet refresh job.
+    // The job is restored to publishing-disabled mode as soon as it starts.
+    mainnetRefreshRequestEnabled: optionalString('ENABLE_MAINNET_ORACLE_REFRESH_REQUESTS', 'false').toLowerCase() === 'true',
+    azureResourceGroup: optionalString('AZURE_ORACLE_RESOURCE_GROUP', 'coverfi_group'),
+    azureJobName: optionalString('AZURE_ORACLE_JOB_NAME', 'coverfi-oracle-mainnet'),
+    // Azure requires an image when a one-off execution overrides command/env.
+    azureJobImage: optionalString('AZURE_ORACLE_JOB_IMAGE', 'coverfioraclecr.azurecr.io/coverfi-oracle-worker:20260726-10'),
+    refreshAsset: optionalString('ORACLE_REFRESH_ASSET', 'XLM Stellar'),
+    refreshAssetContractId: optionalString('ORACLE_REFRESH_ASSET_CONTRACT_ID'),
+    maxPriceSourceAgeMs: optionalNumber('ORACLE_MAX_PRICE_SOURCE_AGE_MS', 5 * 60 * 1000),
+    // Disabled because the active flow has one price source and therefore no
+    // cross-source deviation check.
+    // maxSourceDeviationBps: optionalNumber('ORACLE_MAX_SOURCE_DEVIATION_BPS', 300),
   },
   reserveAttestation: {
     // Optional, testnet-only off-chain signer for public reserve snapshots.
@@ -165,7 +209,7 @@ export const env = {
   },
   business: {
     treasuryWallet: optionalString('COVERFI_TREASURY_WALLET', 'GAUA4NE5ELCWHHWNJSNJH3TRHAVZJPK3UMMVL6XSHAOTQQQ2PS2KV7YZ'),
-    receiptPrintFeeCftusd: optionalNumber('RECEIPT_PRINT_FEE_CFTUSD', 0.1),
+    receiptPrintFeeXlm: optionalNumber('RECEIPT_PRINT_FEE_XLM', 0.1),
     highValueVerificationUsd: optionalNumber('HIGH_VALUE_VERIFICATION_USD', 100),
     targetProtocolFeeBps: optionalNumber('TARGET_PROTOCOL_FEE_BPS', 1200),
   },
@@ -197,11 +241,8 @@ export const env = {
     usernameRegistry: optionalString('USERNAME_REGISTRY_ID', optionalString('VITE_USERNAME_REGISTRY_ID')),
     receiptRegistry: optionalString('RECEIPT_REGISTRY_ID', optionalString('VITE_RECEIPT_REGISTRY_ID')),
     zkVerifier: optionalString('ZK_VERIFIER_CONTRACT_ID', optionalString('VITE_ZK_VERIFIER_CONTRACT_ID')),
-    xlmToken: optionalString('XLM_TESTNET_CONTRACT_ID', optionalString('VITE_XLM_TESTNET_CONTRACT_ID')),
-    payoutToken: optionalString(
-      'CFTUSD_TESTNET_CONTRACT_ID',
-      optionalString('VITE_CFTUSD_TESTNET_CONTRACT_ID', optionalString('VITE_USDC_TESTNET_CONTRACT_ID')),
-    ),
+    xlmToken: optionalString('XLM_CONTRACT_ID', optionalString('XLM_TESTNET_CONTRACT_ID', optionalString('VITE_XLM_TESTNET_CONTRACT_ID'))),
+    payoutToken: optionalString('PAYOUT_TOKEN_CONTRACT_ID', optionalString('XLM_CONTRACT_ID', optionalString('XLM_TESTNET_CONTRACT_ID', optionalString('VITE_XLM_TESTNET_CONTRACT_ID')))),
   },
 };
 

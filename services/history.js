@@ -90,7 +90,7 @@ export async function listWalletActivity(walletAddress, options = {}) {
   }
 
   const eventsResult = isDatabaseConfigured()
-    ? await listWalletEvents(walletAddress, options)
+    ? await listWalletEvents(walletAddress, options).catch(() => ({ events: [], source: 'database-unavailable' }))
     : { events: [], source: 'database-disabled' };
 
   const localRecords = isDatabaseConfigured()

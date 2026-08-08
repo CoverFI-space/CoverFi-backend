@@ -4,6 +4,13 @@ const priceCache = new Map();
 const marketCache = new Map();
 
 const assetFeeds = {
+  // Legacy entries included `coinbaseProduct` values. They stay documented
+  // here while the active feed remains CoinGecko-only:
+  // USDC: { id: 'usd-coin', label: 'USDC on Stellar', coinbaseProduct: 'USDC-USD' },
+  // EURC: { id: 'euro-coin', label: 'EURC on Stellar', coinbaseProduct: 'EURC-USD' },
+  // PYUSD: { id: 'paypal-usd', label: 'PYUSD on Stellar', coinbaseProduct: 'PYUSD-USD' },
+  // XLM: { id: 'stellar', label: 'XLM Stellar', coinbaseProduct: 'XLM-USD' },
+  // USDT: { id: 'tether', label: 'USDT Stellar', coinbaseProduct: 'USDT-USD' },
   USDC: { id: 'usd-coin', label: 'USDC on Stellar' },
   EURC: { id: 'euro-coin', label: 'EURC on Stellar' },
   PYUSD: { id: 'paypal-usd', label: 'PYUSD on Stellar' },
@@ -110,6 +117,60 @@ export async function getUsdPriceForAsset(asset) {
     clearTimeout(timeout);
   }
 }
+
+/*
+ * Legacy alternative price-provider implementations. They are intentionally
+ * commented rather than removed so they can be restored later. The active
+ * application and publisher use CoinGecko only.
+ *
+ * export async function getCryptoCompareUsdPrice(asset) {
+ *   const symbol = normalizeAsset(asset);
+ *   const feed = assetFeeds[symbol];
+ *   if (!feed) throw new PriceFeedError(`No CryptoCompare feed is configured for ${asset}.`, 422);
+ *   if (!env.prices.cryptoCompareApiKey) throw new PriceFeedError('CryptoCompare API key is not configured.', 503);
+ *   const controller = new AbortController();
+ *   const timeout = setTimeout(() => controller.abort(), env.prices.timeoutMs);
+ *   try {
+ *     const url = new URL('/data/price', env.prices.cryptoCompareBaseUrl);
+ *     url.searchParams.set('fsym', symbol);
+ *     url.searchParams.set('tsyms', 'USD');
+ *     url.searchParams.set('api_key', env.prices.cryptoCompareApiKey);
+ *     const response = await fetch(url, { signal: controller.signal });
+ *     const data = await response.json().catch(() => null);
+ *     const price = Number(data?.USD);
+ *     if (!response.ok || !Number.isFinite(price) || price <= 0) {
+ *       throw new PriceFeedError(data?.Message || `CryptoCompare did not return a usable USD price for ${feed.label}.`, response.status || 502);
+ *     }
+ *     return { asset: feed.label, symbol, price, currency: 'USD', lastUpdatedAt: Date.now(), provider: 'CryptoCompare' };
+ *   } catch (error) {
+ *     if (error?.name === 'AbortError') throw new PriceFeedError('CryptoCompare price request timed out.', 504);
+ *     if (error instanceof PriceFeedError) throw error;
+ *     throw new PriceFeedError(error?.message || 'CryptoCompare price request failed.');
+ *   } finally { clearTimeout(timeout); }
+ * }
+ *
+ * export async function getCoinbaseUsdPrice(asset) {
+ *   const symbol = normalizeAsset(asset);
+ *   const feed = assetFeeds[symbol];
+ *   if (!feed?.coinbaseProduct) throw new PriceFeedError(`No Coinbase USD market is configured for ${asset}.`, 422);
+ *   const controller = new AbortController();
+ *   const timeout = setTimeout(() => controller.abort(), env.prices.timeoutMs);
+ *   try {
+ *     const url = new URL(`/api/v3/brokerage/market/products/${encodeURIComponent(feed.coinbaseProduct)}`, env.prices.coinbaseBaseUrl);
+ *     const response = await fetch(url, { signal: controller.signal, headers: { 'cache-control': 'no-cache' } });
+ *     const data = await response.json().catch(() => null);
+ *     const price = Number(data?.mid_market_price || data?.price);
+ *     if (!response.ok || !Number.isFinite(price) || price <= 0) {
+ *       throw new PriceFeedError(`Coinbase did not return a usable USD price for ${feed.label}.`, response.status || 502);
+ *     }
+ *     return { asset: feed.label, symbol, price, currency: 'USD', lastUpdatedAt: Date.now(), provider: 'Coinbase Advanced Trade', product: feed.coinbaseProduct };
+ *   } catch (error) {
+ *     if (error?.name === 'AbortError') throw new PriceFeedError('Coinbase price request timed out.', 504);
+ *     if (error instanceof PriceFeedError) throw error;
+ *     throw new PriceFeedError(error?.message || 'Coinbase price request failed.');
+ *   } finally { clearTimeout(timeout); }
+ * }
+ */
 
 function numberOrNull(value) {
   const number = Number(value);

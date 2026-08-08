@@ -10,7 +10,9 @@
     "test": "node --test",
     "db:migrate": "node scripts/migrate.js",
     "refresh:oracle": "node scripts/refresh-oracle.js",
+    "validate:oracle": "node scripts/validate-mainnet-oracle-config.js",
     "oracle:worker": "node scripts/oracle-worker.js",
+    "oracle:testnet:worker": "node scripts/testnet-oracle-worker.js",
     "indexer:once": "node scripts/indexer-worker.js",
     "indexer:worker": "node scripts/indexer-worker.js --loop",
     "webhooks:once": "node scripts/webhook-worker.js",
@@ -20,7 +22,7 @@
   },
   "dependencies": {
     "@simplewebauthn/server": "^13.3.2",
-    "@stellar/stellar-sdk": "15.1.0",
+    "@stellar/stellar-sdk": "16.1.0",
     "cors": "^2.8.6",
     "dotenv": "^17.4.2",
     "express": "^5.2.1",

@@ -186,6 +186,19 @@ test('wallet auth challenge verifies a Freighter SEP-53 signature', async () => 
   assert.equal(typeof session.token, 'string');
 });
 
+test('readiness is fail-closed and exposes network-specific launch checks', async () => {
+  const response = await fetch(`${baseUrl}/api/status/readiness`);
+  const body = await response.json();
+  const mainnetGate = body.checks.find((check) => check.id === 'mainnet-gate');
+
+  assert.equal(response.status, 200);
+  assert.equal(body.network, 'testnet');
+  assert.equal(body.launchTarget, 'testnet-product-hunt-beta');
+  assert.equal(mainnetGate.ok, true);
+  assert.equal(body.oracle, null);
+  assert.equal(body.reserve, null);
+});
+
 test('transaction authentication verifies a signed non-submittable challenge once', async () => {
   const keypair = Keypair.random();
   const walletAddress = keypair.publicKey();

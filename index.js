@@ -87,6 +87,7 @@ import {
   listWalletEvents,
 } from './services/history.js';
 import { getPortfolioMarkets, getSupportedPriceAssets, getUsdPriceForAsset } from './services/prices.js';
+import { publishFreshTestnetOracleObservation } from './services/oracle-publisher.js';
 import {
   createPaymentInvoice,
   getPublicPaymentInvoice,
@@ -96,6 +97,11 @@ import {
 } from './services/value-protection.js';
 
 const app = express();
+const mainnetOracleRefreshRequests = new Map();
+let mainnetOracleRefreshStart = null;
+const MAINNET_ORACLE_REFRESH_COOLDOWN_MS = 4 * 60 * 1000;
+const TESTNET_ORACLE_ADAPTER_CONTRACT_ID = 'CBAEBBX6ZJGQDWJ4HW2OXJWVGVTQ2THCVFV3O4L3UK3VFDBYW656OV47';
+const TESTNET_XLM_CONTRACT_ID = 'CDLZFC3SYJYDZT7K67VZ75HPJVIEUVNIXF47ZG2FB2RMQQVU2HHGCYSC';
 const usernamePattern = /^[a-zA-Z0-9_]{3,24}$/;
 const walletAddressPattern = /^G[A-Z2-7]{55}$/;
 const txHashPattern = /^[a-fA-F0-9]{64}$/;
@@ -462,7 +468,6 @@ app.use('/api/privacy', createRateLimiter('privacy', env.rateLimit.authMax));
 app.use('/api/ai', createRateLimiter('ai', env.rateLimit.aiMax));
 app.use('/api/partners', createRateLimiter('partners', env.rateLimit.partnerMax));
 app.use('/api/onboarding', createRateLimiter('onboarding', env.rateLimit.authMax));
-app.use('/api/onboarding/testnet/cftusd/fund', createRateLimiter('testnet-cftusd-faucet', Math.min(10, env.rateLimit.authMax)));
 app.use('/api/zk', createRateLimiter('zk', env.rateLimit.partnerMax));
 app.use('/api/analytics', createRateLimiter('analytics', env.rateLimit.partnerMax));
 
@@ -526,13 +531,37 @@ function execFileAsync(file, args, options = {}) {
 }
 
 async function runStellarCli(args) {
+  const stellarCliEnv = { ...process.env };
+  // The API can serve both networks while its own contract configuration is
+  // Mainnet. Do not leak that RPC/passphrase override into a CLI command that
+  // explicitly selects Testnet with `--network testnet`.
+  delete stellarCliEnv.STELLAR_RPC_URL;
+  delete stellarCliEnv.STELLAR_NETWORK;
+  delete stellarCliEnv.STELLAR_NETWORK_PASSPHRASE;
   const result = await execFileAsync('stellar', args, {
     cwd: process.cwd(),
+    env: stellarCliEnv,
     timeout: 120_000,
     windowsHide: true,
     maxBuffer: 1024 * 1024 * 4,
   });
   return `${result.stdout || ''}${result.stderr || ''}`.trim();
+}
+
+async function runStellarCliWithTransientRetry(args, attempts = 3) {
+  let lastError = null;
+  for (let attempt = 1; attempt <= attempts; attempt += 1) {
+    try {
+      return await runStellarCli(args);
+    } catch (error) {
+      lastError = error;
+      const detail = `${error?.message || ''}\n${error?.stderr || ''}\n${error?.stdout || ''}`;
+      const transient = /contract not found|request failed|rpc|timeout|temporar|connection/i.test(detail);
+      if (!transient || attempt === attempts) throw error;
+      await new Promise((resolve) => setTimeout(resolve, attempt * 1_500));
+    }
+  }
+  throw lastError || new Error('Stellar CLI request failed.');
 }
 
 async function getStellarIdentityAddress(identity) {
@@ -548,7 +577,7 @@ async function submitFallbackOracleObservation({
   scaledPrice,
   timestamp,
 }) {
-  return runStellarCli([
+  return runStellarCliWithTransientRetry([
     'contract',
     'invoke',
     '--id',
@@ -570,8 +599,13 @@ async function submitFallbackOracleObservation({
   ]);
 }
 
-async function refreshFallbackOracle({ assetLabel = 'XLM Stellar', assetContractId = env.contracts.xlmToken, network = env.contracts.network || 'testnet' } = {}) {
-  const oracleAdapter = cleanShortString(env.contracts.oracleAdapter, 120);
+async function refreshFallbackOracle({
+  assetLabel = 'XLM Stellar',
+  assetContractId = env.contracts.xlmToken,
+  network = env.contracts.network || 'testnet',
+  oracleAdapterContractId = env.contracts.oracleAdapter,
+} = {}) {
+  const oracleAdapter = cleanShortString(oracleAdapterContractId, 120);
   const cleanAssetContractId = cleanShortString(assetContractId, 120);
   if (!oracleAdapter) {
     const error = new Error('Oracle adapter contract is not configured.');
@@ -585,7 +619,13 @@ async function refreshFallbackOracle({ assetLabel = 'XLM Stellar', assetContract
   }
 
   const now = Date.now();
-  if (lastOracleRefreshResult && now - lastOracleRefreshAt < 15_000) {
+  if (
+    lastOracleRefreshResult
+    && lastOracleRefreshResult.network === network
+    && lastOracleRefreshResult.oracleAdapter === oracleAdapter
+    && lastOracleRefreshResult.assetContractId === cleanAssetContractId
+    && now - lastOracleRefreshAt < 15_000
+  ) {
     return { ...lastOracleRefreshResult, cached: true };
   }
 
@@ -1116,6 +1156,189 @@ function verifyWalletSignature(walletAddress, message, signature) {
   }
 }
 
+function runAzureCli(args, timeout) {
+  const cliEnvironment = { ...process.env };
+  if (process.platform === 'win32') {
+    const azureCliDirectory = 'C:\\Program Files\\Microsoft SDKs\\Azure\\CLI2\\wbin';
+    cliEnvironment.PATH = `${azureCliDirectory};${cliEnvironment.PATH || ''}`;
+  }
+  // Azure CLI is a .cmd shim on Windows. The command and every argument below
+  // are server-controlled; the only dynamic execution name is validated when
+  // Azure returns it before it is used again.
+  return execFileAsync('az', args, {
+    timeout,
+    env: cliEnvironment,
+    shell: process.platform === 'win32',
+  });
+}
+
+function isLocalOracleRefreshRequest(request) {
+  try {
+    const origin = new URL(requestOrigin(request));
+    return ['localhost', '127.0.0.1', '[::1]'].includes(origin.hostname);
+  } catch {
+    return false;
+  }
+}
+
+async function startMainnetOracleRefreshRequest() {
+  const resourceGroup = env.oracle.azureResourceGroup;
+  const jobName = env.oracle.azureJobName;
+  // The stored manual job template is refresh-ready and already owns the
+  // publisher secret references. Starting it without an environment override
+  // preserves those references and avoids the slow update/restore cycle.
+  const startArgs = [
+    'containerapp', 'job', 'start',
+    '--name', jobName,
+    '--resource-group', resourceGroup,
+    '-o', 'json',
+  ];
+
+  /* Legacy one-off execution override, retained for reference. Azure treats
+   * --env-vars as a complete execution environment, which omits secret refs
+   * unless every existing variable is repeated, so it is not used here.
+  const executionOverrideArgs = [
+    'containerapp', 'job', 'start',
+    '--name', jobName,
+    '--resource-group', resourceGroup,
+    '--image', env.oracle.azureJobImage,
+    '--command', 'node',
+    '--args', 'server/scripts/refresh-oracle.js',
+    '--env-vars', 'ENABLE_MAINNET_QUORUM_ORACLE_PUBLISHING=true',
+    '-o', 'json',
+  ];
+  */
+
+  /*
+  // Previous implementation: it changed the stored job template to refresh
+  // mode, started it, then restored validation mode. Those two Azure updates
+  // added roughly a minute before every browser refresh, so they are retained
+  // for reference but are no longer part of the live request path.
+  const updateArgs = [
+    'containerapp', 'job', 'update',
+    '--name', jobName,
+    '--resource-group', resourceGroup,
+    '--command', 'node',
+    '--args', 'server/scripts/refresh-oracle.js',
+    '--set-env-vars',
+    'ENABLE_MAINNET_QUORUM_ORACLE_PUBLISHING=true',
+    // Legacy flag retained as a comment: the publisher is now always
+    // CoinGecko-only, so no runtime switch is needed here.
+    // 'MAINNET_ORACLE_SINGLE_SOURCE_DEMO_MODE=true',
+    '-o', 'none',
+  ];
+  const restoreArgs = [
+    'containerapp', 'job', 'update',
+    '--name', jobName,
+    '--resource-group', resourceGroup,
+    '--command', 'node',
+    '--args', 'server/scripts/validate-mainnet-oracle-config.js',
+    '--set-env-vars',
+    'ENABLE_MAINNET_QUORUM_ORACLE_PUBLISHING=false',
+    // 'MAINNET_ORACLE_SINGLE_SOURCE_DEMO_MODE=true',
+    '-o', 'none',
+  ];
+  */
+
+  const { stdout } = await runAzureCli(startArgs, 45_000);
+  const started = JSON.parse(stdout);
+  if (!started?.name || !/^[a-z0-9-]+$/i.test(started.name)) {
+    throw new Error('Azure did not return a valid oracle refresh execution name.');
+  }
+  const state = { execution: started.name, startedAt: Date.now() };
+  mainnetOracleRefreshRequests.set(state.execution, state);
+  return state;
+}
+
+async function getMainnetOracleRefreshStatus(execution) {
+  const { stdout } = await runAzureCli([
+    'containerapp', 'job', 'execution', 'show',
+    '--name', env.oracle.azureJobName,
+    '--resource-group', env.oracle.azureResourceGroup,
+    '--job-execution-name', execution,
+    '-o', 'json',
+  ], 45_000);
+  const result = JSON.parse(stdout);
+  return {
+    execution,
+    status: String(result?.properties?.status || 'Unknown'),
+    startedAt: result?.properties?.startTime || null,
+    completedAt: result?.properties?.endTime || null,
+  };
+}
+
+async function getLatestMainnetOracleRefreshStatus() {
+  const { stdout } = await runAzureCli([
+    'containerapp', 'job', 'execution', 'list',
+    '--name', env.oracle.azureJobName,
+    '--resource-group', env.oracle.azureResourceGroup,
+    '--query', '[0].{execution:name,status:properties.status,startedAt:properties.startTime,completedAt:properties.endTime}',
+    '-o', 'json',
+  ], 45_000);
+  const result = JSON.parse(stdout || 'null');
+  return result?.execution ? result : null;
+}
+
+const MAINNET_ORACLE_MIN_SPENDABLE_XLM = 0.5;
+
+async function assertMainnetOraclePublisherBalances() {
+  const publisherAddress = (publicKey, secret) => {
+    if (publicKey) return publicKey;
+    try {
+      return secret ? Keypair.fromSecret(secret).publicKey() : '';
+    } catch {
+      return '';
+    }
+  };
+  const publisherAddresses = [
+    publisherAddress(env.oracle.publisher1PublicKey, env.oracle.publisher1Secret),
+    publisherAddress(env.oracle.publisher2PublicKey, env.oracle.publisher2Secret),
+    publisherAddress(env.oracle.publisher3PublicKey, env.oracle.publisher3Secret),
+  ].filter(Boolean);
+  /* Legacy public-key-only lookup, retained for reference. The local API is
+   * also allowed to derive public addresses from its server-only signers.
+  const publisherAddresses = [
+    env.oracle.publisher1PublicKey,
+    env.oracle.publisher2PublicKey,
+    env.oracle.publisher3PublicKey,
+  ].filter(Boolean);
+  */
+  if (publisherAddresses.length !== 3) {
+    const error = new Error('Mainnet oracle publisher addresses are not configured. No Azure job was started.');
+    error.statusCode = 503;
+    throw error;
+  }
+
+  const balances = await Promise.all(publisherAddresses.map(async (address) => {
+    const response = await fetch(`https://horizon.stellar.org/accounts/${encodeURIComponent(address)}`, {
+      headers: { accept: 'application/json' },
+    });
+    const account = await response.json().catch(() => null);
+    if (!response.ok || !account) {
+      const error = new Error(`Could not verify the Mainnet oracle publisher balance for ${address}.`);
+      error.statusCode = 502;
+      throw error;
+    }
+    const nativeBalance = Number(account.balances?.find((balance) => balance.asset_type === 'native')?.balance || 0);
+    // These publisher accounts have no subentries today. Include the standard
+    // reserve calculation so an added trustline cannot be counted as fees.
+    const minimumReserve = 1 + (Number(account.subentry_count) || 0) * 0.5;
+    return { address, spendableXlm: nativeBalance - minimumReserve };
+  }));
+
+  const insufficient = balances.filter(({ spendableXlm }) => spendableXlm < MAINNET_ORACLE_MIN_SPENDABLE_XLM);
+  if (!insufficient.length) return;
+
+  const details = insufficient
+    .map(({ address, spendableXlm }) => `${address.slice(0, 6)}…${address.slice(-4)} (${Math.max(0, spendableXlm).toFixed(3)} XLM spendable)`)
+    .join(', ');
+  const error = new Error(
+    `Mainnet oracle publisher funds are too low: ${details}. Fund each publisher to at least ${MAINNET_ORACLE_MIN_SPENDABLE_XLM.toFixed(1)} XLM spendable, then refresh again. No Azure job was started.`,
+  );
+  error.statusCode = 503;
+  throw error;
+}
+
 async function createTransactionAuthChallenge(walletAddress, nonce, expiresAt) {
   if (!env.server.authChallengeSignerSecret) {
     const error = new Error('This wallet requires transaction-based authentication, which is not configured yet. Use a wallet with message signing or contact CoverFi support.');
@@ -1429,6 +1652,40 @@ function recordOracleStatus(status) {
   while (oracleStatusHistory.length > 96 || (oracleStatusHistory[0] && Date.parse(oracleStatusHistory[0].checkedAt) < cutoff)) {
     oracleStatusHistory.shift();
   }
+}
+
+async function readOracleStatus() {
+  const asset = env.contracts.xlmToken;
+  const [latest, fresh, oracleConfig] = await Promise.all([
+    simulateContractRead(env.contracts.oracleAdapter, 'get_latest', [
+      Address.fromString(asset).toScVal(),
+    ]),
+    simulateContractRead(env.contracts.oracleAdapter, 'get_fresh_price', [
+      Address.fromString(asset).toScVal(),
+    ]),
+    simulateContractRead(env.contracts.oracleAdapter, 'get_config'),
+  ]);
+  const now = Math.floor(Date.now() / 1000);
+  const observation = fresh || latest;
+  const lastUpdatedSeconds = Number(observation?.timestamp || 0);
+  const maxAgeSeconds = Number(oracleConfig?.max_age_seconds || 0);
+  const ageSeconds = lastUpdatedSeconds > 0 ? now - lastUpdatedSeconds : null;
+
+  const status = {
+    ok: Boolean(fresh),
+    status: fresh ? 'fresh' : latest ? 'stale' : 'missing',
+    asset,
+    price: observation?.price || null,
+    lastUpdated: observation?.timestamp || null,
+    checkedAt: new Date().toISOString(),
+    ageSeconds,
+    maxAgeSeconds,
+    fallbackEnabled: Boolean(oracleConfig?.fallback_enabled),
+    source: oracleConfig?.source || null,
+    sourceAsset: oracleConfig?.source_asset || null,
+  };
+  recordOracleStatus(status);
+  return status;
 }
 
 async function readReserveStatus() {
@@ -1747,11 +2004,26 @@ app.get('/api/status/indexer', async (_request, response) => {
 
 app.get('/api/status/readiness', async (_request, response) => {
   try {
-    const [indexer] = await Promise.all([
+    const isMainnet = env.contracts.network === 'mainnet';
+    const [indexer, oracle, reserve] = await Promise.all([
       getIndexerStatus().catch((error) => ({
         ok: false,
         error: error.message || 'indexer status unavailable',
       })),
+      isMainnet
+        ? readOracleStatus().catch((error) => ({
+          ok: false,
+          status: 'unavailable',
+          error: error.message || 'oracle status unavailable',
+        }))
+        : Promise.resolve(null),
+      isMainnet
+        ? readReserveStatus().catch((error) => ({
+          ok: false,
+          status: 'unavailable',
+          error: error.message || 'reserve status unavailable',
+        }))
+        : Promise.resolve(null),
     ]);
 
     const contracts = {
@@ -1765,7 +2037,7 @@ app.get('/api/status/readiness', async (_request, response) => {
     };
     const contractValues = Object.values(contracts);
     const contractsReady = contractValues.every(Boolean);
-    const productionBlocked = env.contracts.network === 'mainnet';
+    const mainnetGateOpen = !isMainnet || env.server.mainnetPublicLaunchEnabled;
     const checks = [
       {
         id: 'database',
@@ -1800,22 +2072,49 @@ app.get('/api/status/readiness', async (_request, response) => {
       {
         id: 'mainnet-gate',
         label: 'Mainnet gate',
-        ok: !productionBlocked,
-        detail: productionBlocked
-          ? 'Mainnet should remain blocked until audit, multisig, legal, and production oracle are complete'
+        ok: mainnetGateOpen,
+        detail: isMainnet
+          ? mainnetGateOpen
+            ? 'Explicit Mainnet launch approval enabled'
+            : 'MAINNET_PUBLIC_LAUNCH_ENABLED is false; keep it false until audit, multisig, legal, and oracle approval are complete'
           : 'Testnet launch mode',
       },
     ];
+    if (isMainnet) {
+      checks.splice(checks.length - 1, 0,
+        {
+          id: 'oracle',
+          label: 'Production oracle',
+          ok: Boolean(oracle?.ok && oracle?.status === 'fresh'),
+          detail: oracle?.status === 'fresh'
+            ? `Fresh; ${oracle.ageSeconds || 0}s old (maximum ${oracle.maxAgeSeconds || 0}s)`
+            : `Not fresh (${oracle?.status || 'unavailable'})`,
+        },
+        {
+          id: 'reserve',
+          label: 'Mainnet reserve',
+          ok: Boolean(reserve?.ok && reserve?.status === 'funded' && Number(reserve?.availableLiquidity || 0) > 0),
+          detail: reserve?.status === 'funded'
+            ? `${reserve.availableLiquidity} stroops available`
+            : `Not funded (${reserve?.status || 'unavailable'})`,
+        },
+      );
+    }
     const score = Math.round((checks.filter((check) => check.ok).length / checks.length) * 100);
+    const ready = isMainnet
+      ? checks.every((check) => check.ok)
+      : score >= 75;
 
     response.json({
-      ok: score >= 75 && !productionBlocked,
+      ok: ready,
       score,
-      launchTarget: 'testnet-product-hunt-beta',
+      launchTarget: isMainnet ? 'mainnet-controlled-launch' : 'testnet-product-hunt-beta',
       network: env.contracts.network,
       checks,
       contracts,
       indexer,
+      oracle,
+      reserve,
       checkedAt: new Date().toISOString(),
     });
   } catch (error) {
@@ -1865,36 +2164,7 @@ app.get('/api/status/atlassian', async (_request, response) => {
 
 app.get('/api/status/oracle', async (_request, response) => {
   try {
-    const asset = env.contracts.xlmToken;
-    const [latest, fresh, oracleConfig] = await Promise.all([
-      simulateContractRead(env.contracts.oracleAdapter, 'get_latest', [
-        Address.fromString(asset).toScVal(),
-      ]),
-      simulateContractRead(env.contracts.oracleAdapter, 'get_fresh_price', [
-        Address.fromString(asset).toScVal(),
-      ]),
-      simulateContractRead(env.contracts.oracleAdapter, 'get_config'),
-    ]);
-    const now = Math.floor(Date.now() / 1000);
-    const observation = fresh || latest;
-    const lastUpdatedSeconds = Number(observation?.timestamp || 0);
-    const maxAgeSeconds = Number(oracleConfig?.max_age_seconds || 0);
-    const ageSeconds = lastUpdatedSeconds > 0 ? now - lastUpdatedSeconds : null;
-
-    const status = {
-      ok: Boolean(fresh),
-      status: fresh ? 'fresh' : latest ? 'stale' : 'missing',
-      asset,
-      price: observation?.price || null,
-      lastUpdated: observation?.timestamp || null,
-      checkedAt: new Date().toISOString(),
-      ageSeconds,
-      maxAgeSeconds,
-      fallbackEnabled: Boolean(oracleConfig?.fallback_enabled),
-      source: oracleConfig?.source || null,
-      sourceAsset: oracleConfig?.source_asset || null,
-    };
-    recordOracleStatus(status);
+    const status = await readOracleStatus();
     response.json({
       ...status,
       // Volatile server-runtime observations, retained only for operational visibility.
@@ -1929,11 +2199,11 @@ app.post('/api/status/oracle/refresh', async (request, response) => {
       });
     }
 
-    const result = await refreshFallbackOracle({
-      assetLabel,
-      assetContractId: env.contracts.xlmToken,
-      network,
-    });
+    if (assetLabel.toUpperCase() !== env.oracle.refreshAsset.toUpperCase()) {
+      return response.status(422).json({ message: `This testnet publisher is configured only for ${env.oracle.refreshAsset}.` });
+    }
+
+    const result = await publishFreshTestnetOracleObservation();
 
     return response.status(result.cached ? 200 : 201).json({
       ...result,
@@ -1980,6 +2250,52 @@ app.get('/api/status/proof-of-reserve', async (_request, response) => {
     response.json(await createTestnetReserveAttestation());
   } catch (error) {
     return sendApiError(response, error.statusCode || 502, 'Could not create the testnet reserve attestation.', error, 'status/proof-of-reserve');
+  }
+});
+
+app.get('/api/history/:walletAddress/stellar', async (request, response) => {
+  const walletAddress = cleanWalletAddress(request.params.walletAddress);
+  if (!isValidWalletAddress(walletAddress)) {
+    return response.status(400).json({ message: 'A valid Stellar wallet address is required.' });
+  }
+
+  const network = cleanShortString(request.query.network || 'testnet', 16).toLowerCase();
+  if (network !== 'mainnet' && network !== 'testnet') {
+    return response.status(400).json({ message: 'Use mainnet or testnet.' });
+  }
+
+  const horizon = network === 'mainnet'
+    ? 'https://horizon.stellar.org'
+    : 'https://horizon-testnet.stellar.org';
+  const account = encodeURIComponent(walletAddress);
+  const historyUrl = (kind) => `${horizon}/accounts/${account}/${kind}?order=desc&limit=50`;
+
+  try {
+    const [paymentsResponse, transactionsResponse] = await Promise.all([
+      fetch(historyUrl('payments')),
+      fetch(historyUrl('transactions')),
+    ]);
+    const [payments, transactions] = await Promise.all([
+      paymentsResponse.ok ? paymentsResponse.json() : Promise.resolve({ _embedded: { records: [] } }),
+      transactionsResponse.ok ? transactionsResponse.json() : Promise.resolve({ _embedded: { records: [] } }),
+    ]);
+
+    return response.json({
+      network,
+      accountFound: paymentsResponse.status !== 404 && transactionsResponse.status !== 404,
+      payments,
+      transactions,
+      checkedAt: new Date().toISOString(),
+    });
+  } catch {
+    // History is an enhancement; unavailable Horizon must not break the page.
+    return response.json({
+      network,
+      accountFound: false,
+      payments: { _embedded: { records: [] } },
+      transactions: { _embedded: { records: [] } },
+      checkedAt: new Date().toISOString(),
+    });
   }
 });
 
@@ -2414,84 +2730,6 @@ app.post('/api/onboarding/wallets/register-or-fund', async (request, response) =
     });
   } catch (error) {
     return sendApiError(response, error.statusCode || 500, error.message || 'Could not register or fund wallet.', error, 'onboarding/wallets/register-or-fund');
-  }
-});
-
-app.post('/api/onboarding/testnet/cftusd/fund', async (request, response) => {
-  try {
-    if (env.contracts.network === 'mainnet') {
-      return response.status(404).json({ message: 'Test CFTUSD faucet is not available on mainnet.' });
-    }
-    if (!isPlainObject(request.body)) {
-      return response.status(400).json({ message: 'Request body must be a JSON object.' });
-    }
-
-    const walletAddress = cleanWalletAddress(request.body.walletAddress);
-    if (!isValidWalletAddress(walletAddress)) {
-      return response.status(400).json({ message: 'A valid Stellar wallet address is required.' });
-    }
-    if (!requireWalletSession(request, response, walletAddress)) {
-      return null;
-    }
-    if (!env.contracts.payoutToken) {
-      return response.status(503).json({ message: 'CFTUSD test token is not configured.' });
-    }
-
-    const requested = decimalToStroops(request.body.amount || '5');
-    const maxAmount = 10n * 10_000_000n;
-    const amount = requested && requested > 0n && requested <= maxAmount
-      ? requested
-      : 5n * 10_000_000n;
-    const sourceAccount = cleanShortString(
-      process.env.CFTUSD_TESTNET_MINT_SOURCE || 'admin2',
-      80,
-    );
-
-    const result = await execFileAsync('stellar', [
-      'contract',
-      'invoke',
-      '--id',
-      env.contracts.payoutToken,
-      '--source-account',
-      sourceAccount,
-      '--network',
-      'testnet',
-      '--',
-      'mint',
-      '--to',
-      walletAddress,
-      '--amount',
-      amount.toString(),
-    ], {
-      cwd: process.cwd(),
-      timeout: 60_000,
-      windowsHide: true,
-    });
-
-    return response.status(201).json({
-      ok: true,
-      walletAddress,
-      token: env.contracts.payoutToken,
-      amount: amount.toString(),
-      amountDisplay: stroopsToDecimalString(amount),
-      sourceAccount,
-      output: String(result.stdout || '').slice(-1200),
-    });
-  } catch (error) {
-    const detail = [
-      error.message || 'Could not fund test CFTUSD.',
-      error.stderr || '',
-      error.stdout || '',
-    ].join('\n');
-    return sendApiError(
-      response,
-      502,
-      detail.includes('trustline entry is missing')
-        ? 'Create the CFTUSD trustline first, then request test CFTUSD again.'
-        : 'Could not fund test CFTUSD.',
-      error,
-      'onboarding/testnet/cftusd/fund',
-    );
   }
 });
 
@@ -3426,7 +3664,7 @@ app.get('/api/partner/v1/assets', async (request, response) => {
           asset: 'XLM',
           network: env.contracts.network,
           protectedAssetContractId: env.contracts.xlmToken,
-          payoutAsset: 'CFTUSD',
+          payoutAsset: 'XLM',
           payoutAssetContractId: env.contracts.payoutToken,
           testnetOnly: env.contracts.network !== 'mainnet',
         },
@@ -3810,7 +4048,7 @@ app.get('/api/partners/market-config', async (request, response) => {
       assets: {
         protected: env.contracts.xlmToken,
         payout: env.contracts.payoutToken,
-        payoutSymbol: 'CFTUSD',
+        payoutSymbol: 'XLM',
       },
       partner: {
         id: partner.partner_id,
@@ -4114,6 +4352,187 @@ app.post('/api/partners/webhooks/test', async (request, response) => {
     });
   } catch (error) {
     return sendApiError(response, error.statusCode || 500, error.message || 'Could not prepare webhook test.', error, 'partners/webhooks/test');
+  }
+});
+
+// User-initiated protection refresh. The browser never supplies a price: this
+// service fetches CoinGecko itself and the configured publisher stores that
+// observation through the already-deployed contract interface.
+// Previous limit retained for reference: createRateLimiter('protection-price-refresh', 2, 60_000).
+// Transaction preparation, wallet retries, and React development remounts can
+// legitimately overlap; the publisher flow itself already deduplicates work.
+app.post('/api/protection/prices/refresh', createRateLimiter('protection-price-refresh', 12, 60_000), async (request, response) => {
+  if (!isPlainObject(request.body)) {
+    return response.status(400).json({ message: 'Request body must be a JSON object.' });
+  }
+
+  const network = cleanShortString(request.body.network, 20).toLowerCase();
+  const asset = cleanShortString(request.body.asset || env.oracle.refreshAsset, 80);
+  const requestedSymbol = asset.split(/\s+/)[0]?.toUpperCase();
+  const configuredSymbol = String(env.oracle.refreshAsset || '').split(/\s+/)[0]?.toUpperCase();
+  if (!['testnet', 'mainnet'].includes(network)) {
+    return response.status(400).json({ message: 'Use testnet or mainnet.' });
+  }
+  if (!requestedSymbol || requestedSymbol !== configuredSymbol) {
+    return response.status(422).json({ message: `CoinGecko refresh is configured only for ${env.oracle.refreshAsset}.` });
+  }
+
+  /* Temporary page-only CoinGecko refresh, retained but disabled now that
+   * Refresh Price again saves through the authorised on-chain publisher.
+  try {
+    const price = await getUsdPriceForAsset(asset);
+    return response.json({
+      status: 'PriceFetched',
+      priceUsd: price.price,
+      source: 'CoinGecko',
+      timestamp: Math.floor(Date.now() / 1000),
+      onChain: false,
+      message: 'CoinGecko price fetched for page display only. No Azure job or on-chain publisher was started.',
+    });
+  } catch (error) {
+    return sendApiError(response, error.statusCode || 502, error.message || 'Could not fetch the CoinGecko price.', error, 'protection/prices/refresh');
+  }
+  */
+
+  // Authorized CoinGecko -> on-chain publisher flow.
+  try {
+    if (network === 'testnet') {
+      // Testnet always uses the local, already-authorized Testnet publisher
+      // identities. CoinGecko is the sole market-price source. This remains an
+      // on-chain write only because the unchanged Protection contract requires
+      // a fresh adapter observation before it accepts a position.
+      const result = await refreshFallbackOracle({
+        assetLabel: asset,
+        assetContractId: TESTNET_XLM_CONTRACT_ID,
+        network: 'testnet',
+        oracleAdapterContractId: TESTNET_ORACLE_ADAPTER_CONTRACT_ID,
+      });
+      /* Previous environment-bound Testnet publisher path retained for
+       * dedicated Testnet server deployments:
+       *
+       * if (!env.oracle.automaticRefreshEnabled) {
+       *   return response.status(503).json({ message: 'Testnet CoinGecko publishing is not enabled on this server.' });
+       * }
+       * if (env.contracts.network !== 'testnet') {
+       *   return response.status(409).json({ message: 'This server is not configured with the Testnet publisher.' });
+       * }
+       * const result = await publishFreshTestnetOracleObservation();
+       */
+      return response.status(201).json({
+        status: 'Succeeded',
+        priceUsd: result.priceUsd,
+        source: result.provider,
+        timestamp: result.timestamp,
+      });
+    }
+
+    if (!env.oracle.mainnetRefreshRequestEnabled) {
+      return response.status(503).json({ message: 'Mainnet CoinGecko publishing is not enabled on this server.' });
+    }
+
+    const recent = Array.from(mainnetOracleRefreshRequests.values())
+      .sort((left, right) => right.startedAt - left.startedAt)[0];
+    const latest = recent
+      ? await getMainnetOracleRefreshStatus(recent.execution)
+      : await getLatestMainnetOracleRefreshStatus();
+    const completedAt = latest?.completedAt ? Date.parse(latest.completedAt) : Number.NaN;
+    const validUntil = Number.isFinite(completedAt)
+      ? completedAt + 5 * 60 * 1000
+      : Number.NaN;
+    if (latest?.status === 'Succeeded' && validUntil > Date.now()) {
+      return response.json({
+        execution: latest.execution,
+        status: 'Succeeded',
+        validUntil: new Date(validUntil).toISOString(),
+        message: 'A fresh on-chain observation is already available.',
+      });
+    }
+    if (latest && ['Starting', 'Running'].includes(latest.status)) {
+      return response.status(202).json({
+        execution: latest.execution,
+        status: latest.status,
+      });
+    }
+    await assertMainnetOraclePublisherBalances();
+    if (!mainnetOracleRefreshStart) {
+      mainnetOracleRefreshStart = startMainnetOracleRefreshRequest()
+        .finally(() => { mainnetOracleRefreshStart = null; });
+    }
+    const started = await mainnetOracleRefreshStart;
+    return response.status(202).json({ ...started, status: 'Starting' });
+  } catch (error) {
+    return sendApiError(response, error.statusCode || 502, error.message || 'Could not save the CoinGecko price on-chain.', error, 'protection/prices/refresh');
+  }
+  // */ Legacy page-only mode ends above; authorised refresh is active again.
+});
+
+app.get('/api/protection/prices/refresh/:execution', async (request, response) => {
+  const execution = cleanShortString(request.params.execution, 100);
+  if (!env.oracle.mainnetRefreshRequestEnabled || !mainnetOracleRefreshRequests.has(execution)) {
+    return response.status(404).json({ message: 'Unknown price refresh request.' });
+  }
+  try {
+    return response.json(await getMainnetOracleRefreshStatus(execution));
+  } catch (error) {
+    return sendApiError(response, 502, error.message || 'Could not read on-chain price refresh status.', error, 'protection/prices/refresh/status');
+  }
+});
+
+app.post('/api/oracle/mainnet-refresh', async (request, response) => {
+  // This legacy route is deliberately unavailable while page-only CoinGecko
+  // refresh is enabled. It must not start an Azure publishing execution.
+  return response.status(410).json({
+    message: 'On-chain oracle publishing is disabled. Refresh price fetches CoinGecko for page display only.',
+  });
+
+  /* Legacy Azure publishing endpoint, retained but disabled.
+  if (!env.oracle.mainnetRefreshRequestEnabled) {
+    return response.status(403).json({ message: 'Mainnet price refresh is not enabled on this server.' });
+  }
+  if (!isLocalOracleRefreshRequest(request)) {
+    return response.status(403).json({ message: 'Mainnet price refresh is available only from the local pitch application.' });
+  }
+
+  try {
+    const recent = Array.from(mainnetOracleRefreshRequests.values())
+      .sort((left, right) => right.startedAt - left.startedAt)[0];
+    if (recent && Date.now() - recent.startedAt < MAINNET_ORACLE_REFRESH_COOLDOWN_MS) {
+      return response.status(202).json({
+        execution: recent.execution,
+        status: 'Running',
+        message: 'A recent oracle refresh is already in progress or still within the protected refresh window.',
+      });
+    }
+
+    if (!mainnetOracleRefreshStart) {
+      mainnetOracleRefreshStart = startMainnetOracleRefreshRequest()
+        .finally(() => { mainnetOracleRefreshStart = null; });
+    }
+    const started = await mainnetOracleRefreshStart;
+    return response.status(202).json({
+      ...started,
+      status: 'Starting',
+      message: 'Refreshing the on-chain XLM price. This usually takes under a minute.',
+    });
+  } catch (error) {
+    return sendApiError(response, 502, error.message || 'Could not start the on-chain price refresh.', error, 'oracle/mainnet-refresh');
+  }
+  */
+});
+
+app.get('/api/oracle/mainnet-refresh/:execution', async (request, response) => {
+  const execution = cleanShortString(request.params.execution, 100);
+  if (!env.oracle.mainnetRefreshRequestEnabled || !mainnetOracleRefreshRequests.has(execution)) {
+    return response.status(404).json({ message: 'Unknown oracle refresh request.' });
+  }
+  if (!isLocalOracleRefreshRequest(request)) {
+    return response.status(403).json({ message: 'Mainnet price refresh status is available only from the local pitch application.' });
+  }
+
+  try {
+    return response.json(await getMainnetOracleRefreshStatus(execution));
+  } catch (error) {
+    return sendApiError(response, 502, error.message || 'Could not read the on-chain price refresh status.', error, 'oracle/mainnet-refresh/status');
   }
 });
 

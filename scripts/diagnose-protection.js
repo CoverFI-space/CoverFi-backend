@@ -40,7 +40,7 @@ function requiredConfig() {
     PROTECTION_ENGINE_CONTRACT_ID: env.contracts.protectionEngine,
     RESERVE_VAULT_CONTRACT_ID: env.contracts.reserveVault,
     XLM_TESTNET_CONTRACT_ID: env.contracts.xlmToken,
-    CFTUSD_TESTNET_CONTRACT_ID: env.contracts.payoutToken,
+    PAYOUT_TOKEN_CONTRACT_ID: env.contracts.payoutToken,
   })
     .filter(([, value]) => !value)
     .map(([name]) => name);

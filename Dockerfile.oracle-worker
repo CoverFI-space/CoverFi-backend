@@ -1,0 +1,11 @@
+FROM node:24-alpine AS dependencies
+WORKDIR /app/server
+COPY package*.json ./
+RUN npm ci --omit=dev
+
+FROM node:24-alpine AS worker
+ENV NODE_ENV=production
+WORKDIR /app
+COPY --from=dependencies /app/server/node_modules ./server/node_modules
+COPY . ./server
+CMD ["node", "server/scripts/refresh-oracle.js"]
