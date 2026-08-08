@@ -186,6 +186,20 @@ test('wallet auth challenge verifies a Freighter SEP-53 signature', async () => 
   assert.equal(typeof session.token, 'string');
 });
 
+test('cors always allows the production CoverFi application', async () => {
+  const response = await fetch(`${baseUrl}/api/auth/challenge`, {
+    method: 'OPTIONS',
+    headers: {
+      origin: 'https://app.coverfi.space',
+      'access-control-request-method': 'POST',
+      'access-control-request-headers': 'content-type',
+    },
+  });
+
+  assert.equal(response.status, 204);
+  assert.equal(response.headers.get('access-control-allow-origin'), 'https://app.coverfi.space');
+});
+
 test('readiness is fail-closed and exposes network-specific launch checks', async () => {
   const response = await fetch(`${baseUrl}/api/status/readiness`);
   const body = await response.json();

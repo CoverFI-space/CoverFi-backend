@@ -152,7 +152,14 @@ function isAllowedOrigin(origin) {
     return true;
   }
 
+  // Keep the public CoverFi applications reachable even when an App Service
+  // deployment is missing or temporarily replaces CLIENT_ORIGINS.
   const configuredOrigins = new Set([
+    'https://coverfi.space',
+    'https://www.coverfi.space',
+    'https://app.coverfi.space',
+    'https://partner.coverfi.space',
+    'https://monitor.coverfi.space',
     env.server.clientOrigin,
     ...env.server.clientOrigins,
   ].filter(Boolean));
