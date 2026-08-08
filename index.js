@@ -142,6 +142,9 @@ const ORACLE_PRICE_SCALE = 100_000_000;
 let oracleRefreshInFlight = null;
 let lastOracleRefreshResult = null;
 let lastOracleRefreshAt = 0;
+let testnetOraclePublishInFlight = null;
+let lastTestnetOraclePublishResult = null;
+let lastTestnetOraclePublishAt = 0;
 let reserveAttestationCache = null;
 const oracleStatusHistory = [];
 
@@ -1161,6 +1164,25 @@ function verifyWalletSignature(walletAddress, message, signature) {
   } catch {
     return false;
   }
+}
+
+async function publishFreshTestnetOracleObservationOnce() {
+  const now = Date.now();
+  if (lastTestnetOraclePublishResult && now - lastTestnetOraclePublishAt < 15_000) {
+    return { ...lastTestnetOraclePublishResult, cached: true };
+  }
+  if (testnetOraclePublishInFlight) return testnetOraclePublishInFlight;
+
+  testnetOraclePublishInFlight = publishFreshTestnetOracleObservation()
+    .then((result) => {
+      lastTestnetOraclePublishResult = result;
+      lastTestnetOraclePublishAt = Date.now();
+      return result;
+    })
+    .finally(() => {
+      testnetOraclePublishInFlight = null;
+    });
+  return testnetOraclePublishInFlight;
 }
 
 function runAzureCli(args, timeout) {
@@ -2210,7 +2232,9 @@ app.post('/api/status/oracle/refresh', async (request, response) => {
       return response.status(422).json({ message: `This testnet publisher is configured only for ${env.oracle.refreshAsset}.` });
     }
 
-    const result = await publishFreshTestnetOracleObservation();
+    // Previous direct call retained for reference:
+    // const result = await publishFreshTestnetOracleObservation();
+    const result = await publishFreshTestnetOracleObservationOnce();
 
     return response.status(result.cached ? 200 : 201).json({
       ...result,
@@ -4404,31 +4428,29 @@ app.post('/api/protection/prices/refresh', createRateLimiter('protection-price-r
   // Authorized CoinGecko -> on-chain publisher flow.
   try {
     if (network === 'testnet') {
-      // Testnet always uses the local, already-authorized Testnet publisher
-      // identities. CoinGecko is the sole market-price source. This remains an
-      // on-chain write only because the unchanged Protection contract requires
-      // a fresh adapter observation before it accepts a position.
-      const result = await refreshFallbackOracle({
-        assetLabel: asset,
-        assetContractId: TESTNET_XLM_CONTRACT_ID,
-        network: 'testnet',
-        oracleAdapterContractId: TESTNET_ORACLE_ADAPTER_CONTRACT_ID,
-      });
-      /* Previous environment-bound Testnet publisher path retained for
-       * dedicated Testnet server deployments:
-       *
-       * if (!env.oracle.automaticRefreshEnabled) {
-       *   return response.status(503).json({ message: 'Testnet CoinGecko publishing is not enabled on this server.' });
-       * }
-       * if (env.contracts.network !== 'testnet') {
-       *   return response.status(409).json({ message: 'This server is not configured with the Testnet publisher.' });
-       * }
-       * const result = await publishFreshTestnetOracleObservation();
+      // Testnet uses the server-side SDK publisher because Azure App Service
+      // does not install the local `stellar` CLI binary. CoinGecko remains the
+      // sole market-price source; the two configured keys are the existing
+      // authorized adapter publishers required by the unchanged contract.
+      if (!env.oracle.automaticRefreshEnabled) {
+        return response.status(503).json({ message: 'Testnet CoinGecko publishing is not enabled on this server.' });
+      }
+      if (env.contracts.network !== 'testnet') {
+        return response.status(409).json({ message: 'This server is not configured with the Testnet publisher.' });
+      }
+      const result = await publishFreshTestnetOracleObservationOnce();
+      /* Previous local-CLI publisher retained for deployment history:
+       * const result = await refreshFallbackOracle({
+       *   assetLabel: asset,
+       *   assetContractId: TESTNET_XLM_CONTRACT_ID,
+       *   network: 'testnet',
+       *   oracleAdapterContractId: TESTNET_ORACLE_ADAPTER_CONTRACT_ID,
+       * });
        */
       return response.status(201).json({
         status: 'Succeeded',
         priceUsd: result.priceUsd,
-        source: result.provider,
+        source: result.source,
         timestamp: result.timestamp,
       });
     }
