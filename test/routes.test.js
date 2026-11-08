@@ -36,7 +36,7 @@ async function createSignedWalletSession(keypair) {
     body: JSON.stringify({ walletAddress }),
   });
   const challenge = await challengeResponse.json();
-  const signature = keypair.sign(Buffer.from(challenge.message, 'utf8')).toString('base64');
+  const signature = Buffer.from(keypair.sign(Buffer.from(challenge.message, 'utf8'))).toString('base64');
   const sessionResponse = await fetch(`${baseUrl}/api/auth/session`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
@@ -52,9 +52,7 @@ async function createSignedWalletSession(keypair) {
 }
 
 function signSep53Message(keypair, message) {
-  return keypair
-    .sign(crypto.createHash('sha256').update(`Stellar Signed Message:\n${message}`).digest())
-    .toString('base64');
+  return Buffer.from(keypair.sign(crypto.createHash('sha256').update(`Stellar Signed Message:\n${message}`).digest())).toString('base64');
 }
 
 test('legal status exposes current trust disclaimer', async () => {
@@ -139,7 +137,7 @@ test('wallet auth challenge verifies a Stellar signature', async () => {
   assert.equal(typeof challenge.message, 'string');
   assert.equal(typeof challenge.nonce, 'string');
 
-  const signature = keypair.sign(Buffer.from(challenge.message, 'utf8')).toString('base64');
+  const signature = Buffer.from(keypair.sign(Buffer.from(challenge.message, 'utf8'))).toString('base64');
   const sessionResponse = await fetch(`${baseUrl}/api/auth/session`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
@@ -263,7 +261,7 @@ test('zk proof status returns wallet verified proof events after signed session'
     purpose: 'route-test',
   });
   const digest = crypto.createHash('sha256').update(Buffer.from(message, 'utf8')).digest('hex');
-  const signature = keypair.sign(Buffer.from(message, 'utf8')).toString('base64');
+  const signature = Buffer.from(keypair.sign(Buffer.from(message, 'utf8'))).toString('base64');
 
   const recordResponse = await fetch(`${baseUrl}/api/zk/proofs/record`, {
     method: 'POST',

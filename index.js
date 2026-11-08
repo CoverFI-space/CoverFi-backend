@@ -1397,7 +1397,7 @@ async function createTransactionAuthChallenge(walletAddress, nonce, expiresAt) {
 
   return {
     xdr: transaction.toXDR(),
-    transactionHash: transaction.hash().toString('hex'),
+    transactionHash: Buffer.from(transaction.hash()).toString('hex'),
   };
 }
 
@@ -1405,9 +1405,9 @@ function verifyTransactionAuthSignature(walletAddress, signedTxXdr, expectedHash
   try {
     const transaction = TransactionBuilder.fromXDR(signedTxXdr, env.contracts.networkPassphrase);
     const hash = transaction.hash();
-    if (hash.toString('hex') !== expectedHash) return false;
+    if (Buffer.from(hash).toString('hex') !== expectedHash) return false;
     const keypair = Keypair.fromPublicKey(walletAddress);
-    return transaction.signatures.some((signature) => keypair.verify(hash, signature.signature()));
+    return transaction.signatures.some((signature) => keypair.verify(hash, signature.signature.toBytes()));
   } catch {
     return false;
   }
